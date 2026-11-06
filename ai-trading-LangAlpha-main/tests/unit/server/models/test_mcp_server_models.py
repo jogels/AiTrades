@@ -1,0 +1,746 @@
+"""Validation + response-shaping unit tests for the MCP server Pydantic models.
+
+Covers the API security boundary: name regex, transport coherence, command
+allowlist (no bash), URL policy (incl. metadata IP / userinfo / private ranges),
+vault-ref vs bare host-env values, length caps, forbidden keys, and the
+owner-scoped echo of the stored env/header maps (never a resolved secret).
+"""
+
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from src.server.models.mcp_server import (
+    McpServerInput,
+    ProbeInput,
+    catalog_row_to_response,
+    coerce_mcp_name,
+    collect_vault_refs,
+    isolation_warnings,
+    normalize_transport,
+    parse_mcp_servers_payload,
+    sandbox_name_error,
+    validate_remote_url,
+)
+
+
+def _stdio(**overrides) -> dict:
+    base = {"name": "neutral_server", "transport": "stdio", "command": "npx"}
+    base.update(overrides)
+    return base
+
+
+def _http(**overrides) -> dict:
+    base = {
+        "name": "remote_server",
+        "transport": "http",
+        "url": "https://api.example.com/mcp",
+    }
+    base.update(overrides)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Name regex
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["ok", "_ok", "Ok_1", "a" * 64])
+def test_name_accepts_valid(name):
+    assert McpServerInput(**_stdio(name=name)).name == name
+
+
+@pytest.mark.parametrize(
+    "name", ["1bad", "has-dash", "has.dot", "", "a" * 65, "has space", "trailing\n"]
+)
+def test_name_rejects_invalid(name):
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(name=name))
+
+
+@pytest.mark.parametrize(
+    "name,reason",
+    [
+        ("mcp_client", "MCP runtime module"),
+        ("__init__", "must not start with '__'"),
+        ("__private", "must not start with '__'"),
+        ("class", "Python keyword"),
+        ("None", "Python keyword"),
+        ("await", "Python keyword"),
+    ],
+)
+def test_sandbox_reserves_the_runtime_dunders_and_hard_keywords(name, reason):
+    # The name becomes a module in the sandbox's tools package, so the message
+    # has to say that rather than restate the shape rule the name passes.
+    assert reason in (sandbox_name_error(name) or "")
+
+
+@pytest.mark.parametrize(
+    "name", ["match", "case", "type", "_", "class_server", "mcp_client_v2", "_private", "Type"]
+)
+def test_sandbox_accepts_soft_keywords_and_near_misses(name):
+    # ``from tools.match import ...`` parses: a soft keyword is a legal module.
+    assert sandbox_name_error(name) is None
+    assert McpServerInput(**_stdio(name=name)).name == name
+
+
+def test_the_model_checks_shape_only_so_an_edit_keeps_a_reserved_name():
+    # The doors that introduce a name refuse a reserved one; the model also
+    # carries edits of rows saved before their name was reserved.
+    assert McpServerInput(**_stdio(name="class")).name == "class"
+
+
+# ---------------------------------------------------------------------------
+# Transport coherence
+# ---------------------------------------------------------------------------
+
+
+def test_stdio_requires_command():
+    with pytest.raises(ValidationError):
+        McpServerInput(name="x", transport="stdio")
+
+
+def test_stdio_forbids_url_and_headers():
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(url="https://x.example.com/m"))
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(headers={"Authorization": "literal"}))
+
+
+def test_http_requires_url():
+    with pytest.raises(ValidationError):
+        McpServerInput(name="x", transport="http")
+
+
+def test_http_forbids_command_args_env():
+    with pytest.raises(ValidationError):
+        McpServerInput(**_http(command="npx"))
+    with pytest.raises(ValidationError):
+        McpServerInput(**_http(args=["-y"]))
+    with pytest.raises(ValidationError):
+        McpServerInput(**_http(env={"MODE": "prod"}))
+
+
+def test_sse_requires_url():
+    with pytest.raises(ValidationError):
+        McpServerInput(name="x", transport="sse")
+    srv = McpServerInput(name="x", transport="sse", url="https://api.example.com/sse")
+    assert srv.transport == "sse"
+
+
+# ---------------------------------------------------------------------------
+# Command — not filtered
+# ---------------------------------------------------------------------------
+
+
+# Every one of these is how some published MCP server documents its own launch.
+# The list is not a contract about what we run, it is the evidence that a
+# closed one would have made these uninstallable.
+@pytest.mark.parametrize(
+    "cmd",
+    ["npx", "uvx", "docker", "deno", "bun", "go", "java", "/usr/local/bin/srv", "./srv"],
+)
+def test_any_command_is_accepted(cmd):
+    assert McpServerInput(**_stdio(command=cmd)).command == cmd
+
+
+def test_stdio_still_requires_a_command():
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(command=""))
+
+
+# ---------------------------------------------------------------------------
+# URL policy
+# ---------------------------------------------------------------------------
+
+
+def test_url_accepts_public_https():
+    assert validate_remote_url("https://api.example.com/mcp")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://api.example.com/mcp",  # not https
+        "https://user:pw@api.example.com/mcp",  # userinfo
+        "https://10.0.0.5/mcp",  # private 10/8
+        "https://172.16.0.1/mcp",  # private 172.16/12
+        "https://192.168.1.1/mcp",  # private 192.168/16
+        "https://127.0.0.1/mcp",  # loopback
+        "https://169.254.169.254/latest/meta-data",  # link-local metadata
+        "https://100.64.0.1/mcp",  # CGNAT 100.64/10 (not is_global)
+        "https://2130706433/mcp",  # decimal-int 127.0.0.1 (inet_aton form)
+        "https://0x7f000001/mcp",  # hex 127.0.0.1
+        "https://0177.0.0.1/mcp",  # octal-octet 127.0.0.1
+        "https://127.1/mcp",  # short-dotted 127.0.0.1
+        "https://2852039166/mcp",  # decimal-int 169.254.169.254 metadata
+        "https://[::ffff:169.254.169.254]/mcp",  # ipv4-mapped metadata
+        "https://[::1]/mcp",  # ipv6 loopback
+        "https://localhost/mcp",  # localhost
+        "https://svc.local/mcp",  # *.local
+        "https://svc.internal/mcp",  # *.internal
+        "https://svc.localhost/mcp",  # *.localhost
+        "https://api.example.com/${vault:TOK}",  # secret in url
+        "https://api.example.com/${VAR}/mcp",  # brace env placeholder
+        "https://api.example.com/${vault:TOK",  # unclosed brace form
+        "https://api.example.com:99999/mcp",  # port out of range
+        "https://api.example.com:notaport/mcp",  # non-numeric port
+    ],
+)
+def test_url_policy_rejects(url):
+    with pytest.raises(ValueError):
+        validate_remote_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.example.com/$batch",  # OData batch endpoint
+        "https://api.example.com/odata?$filter=status%20eq%20'active'",
+        "https://api.example.com/odata?$select=name&$top=100",
+    ],
+)
+def test_url_policy_accepts_bare_dollar_path_segments(url):
+    """Bare ``$word`` is a legitimate URL convention (OData) and is inert
+    downstream — only brace placeholder forms are rejected."""
+    validate_remote_url(url)
+
+
+def test_metadata_ip_rejected_via_model():
+    with pytest.raises(ValidationError):
+        McpServerInput(**_http(url="https://169.254.169.254/latest/meta-data"))
+
+
+# ---------------------------------------------------------------------------
+# env / header values
+# ---------------------------------------------------------------------------
+
+
+def test_env_accepts_vault_ref_and_literal():
+    srv = McpServerInput(**_stdio(env={"TOK": "${vault:MY_TOKEN}", "MODE": "prod"}))
+    assert srv.env["TOK"] == "${vault:MY_TOKEN}"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["${INTERNAL_SERVICE_TOKEN}", "$HOME", "prefix-${VAR}", "${vault:bad name}"],
+)
+def test_env_rejects_bare_host_env_values(value):
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(env={"TOK": value}))
+
+
+def test_header_accepts_vault_ref():
+    srv = McpServerInput(**_http(headers={"Authorization": "${vault:API_KEY}"}))
+    assert srv.headers["Authorization"] == "${vault:API_KEY}"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Bearer ${vault:API_KEY}",
+        "token ${vault:API_KEY}",
+        "${vault:USER}:${vault:PASS}",
+        "${vault:API_KEY} suffix",
+    ],
+)
+def test_header_accepts_a_ref_embedded_in_a_larger_value(value):
+    # `Bearer <token>` is how nearly every MCP server wants its Authorization
+    # header, and the sandbox substitutes refs in place rather than replacing
+    # the field. Requiring the whole value to be the reference meant the scheme
+    # word had to live inside the secret.
+    srv = McpServerInput(**_http(headers={"Authorization": value}))
+    assert srv.headers["Authorization"] == value
+
+
+def test_an_embedded_ref_does_not_excuse_the_rest_of_the_value():
+    with pytest.raises(ValidationError):
+        McpServerInput(
+            **_http(headers={"Authorization": "Bearer ${vault:OK} ${HOME}"})
+        )
+
+
+def test_header_rejects_bare_host_env_value():
+    with pytest.raises(ValidationError):
+        McpServerInput(**_http(headers={"Authorization": "${SECRET}"}))
+
+
+def test_headers_colliding_only_in_case_are_rejected():
+    # The probe and the sandbox keep both spellings, while the relay folds the
+    # map to lowercase and keeps whichever lands last, so the value on the wire
+    # is not the one the owner can point at in the form.
+    with pytest.raises(ValidationError):
+        McpServerInput(
+            **_http(headers={"Authorization": "a", "authorization": "b"})
+        )
+
+
+def test_two_distinct_header_names_still_pass():
+    srv = McpServerInput(
+        **_http(headers={"Authorization": "a", "X-Trace": "b"})
+    )
+    assert srv.headers == {"Authorization": "a", "X-Trace": "b"}
+
+
+@pytest.mark.parametrize("key", ["1bad", "has space", "a" * 129])
+def test_env_key_rejected(key):
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(env={key: "literal"}))
+
+
+@pytest.mark.parametrize(
+    "arg",
+    ["--flag=${vault:TOKEN}", "${vault:TOKEN}", "--verbose", "package-name", "$100"],
+)
+def test_args_accept_vault_refs_and_literals(arg):
+    srv = McpServerInput(**_stdio(args=[arg]))
+    assert srv.args == [arg]
+
+
+@pytest.mark.parametrize(
+    "arg",
+    ["${HOME}", "$HOME", "--dir=${HOME}/x", "--x=${vault:bad name}", "--x=${vault:"],
+)
+def test_args_reject_host_env_and_malformed_vault(arg):
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(args=[arg]))
+
+
+# ---------------------------------------------------------------------------
+# Length caps
+# ---------------------------------------------------------------------------
+
+
+def test_description_cap():
+    McpServerInput(**_stdio(description="x" * 512))
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(description="x" * 513))
+
+
+def test_instruction_cap():
+    McpServerInput(**_stdio(instruction="x" * 1024))
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(instruction="x" * 1025))
+
+
+def test_tool_exposure_mode_enum():
+    assert McpServerInput(**_stdio(tool_exposure_mode="detailed")).tool_exposure_mode == "detailed"
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(tool_exposure_mode="verbose"))
+
+
+def test_discovery_uses_secrets_defaults_off_and_round_trips():
+    # Default is the safe secret-less posture.
+    assert McpServerInput(**_stdio()).discovery_uses_secrets is False
+    assert McpServerInput(**_stdio()).to_config_blob()["discovery_uses_secrets"] is False
+    # Explicit opt-in round-trips into the persisted config blob.
+    srv = McpServerInput(**_stdio(discovery_uses_secrets=True))
+    assert srv.discovery_uses_secrets is True
+    assert srv.to_config_blob()["discovery_uses_secrets"] is True
+
+
+def test_catalog_row_discovery_uses_secrets_in_response():
+    row = {
+        "plugin_name": None,
+        "plugin_enabled": None,
+        "name": "remote_server",
+        "transport": "http",
+        "command": None,
+        "args": [],
+        "url": "https://api.example.com/mcp",
+        "env": {},
+        "headers": {},
+        "description": "",
+        "instruction": "",
+        "tool_exposure_mode": "summary",
+        "discovery_uses_secrets": True,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+    assert catalog_row_to_response(row).discovery_uses_secrets is True
+    # A row missing the field defaults to off.
+    del row["discovery_uses_secrets"]
+    assert catalog_row_to_response(row).discovery_uses_secrets is False
+
+
+# ---------------------------------------------------------------------------
+# Isolation warnings — non-blocking nudges on an otherwise valid definition
+# ---------------------------------------------------------------------------
+
+
+def test_sse_transport_warns_it_is_not_executable():
+    # The sandbox client refuses legacy sse outright, so a silently-accepted
+    # sse server saves looking healthy and fails on every tool call.
+    server = McpServerInput(**_http(transport="sse"))
+    [warning] = isolation_warnings(server)
+    assert "sse" in warning
+    assert "http" in warning
+    # A warning, never a rejection — legacy imports must keep landing.
+    assert server.transport == "sse"
+
+
+def test_http_and_isolated_stdio_gain_no_warning():
+    assert isolation_warnings(McpServerInput(**_http())) == []
+    assert isolation_warnings(McpServerInput(**_stdio(command="npx"))) == []
+    assert isolation_warnings(McpServerInput(**_stdio(command="uvx"))) == []
+
+
+def test_shared_env_stdio_command_still_warns():
+    [warning] = isolation_warnings(McpServerInput(**_stdio(command="python")))
+    assert "shared sandbox" in warning
+
+
+# ---------------------------------------------------------------------------
+# Forbidden keys — reject, don't strip
+# ---------------------------------------------------------------------------
+
+
+def test_vault_blueprints_rejected():
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(vault_blueprints=[]))
+
+
+def test_source_key_rejected():
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(source="workspace"))
+
+
+def test_auth_key_rejected():
+    # ``auth`` hands a server the sandbox's own data token: built-ins only.
+    with pytest.raises(ValidationError, match="'auth' is not allowed"):
+        McpServerInput(**_http(auth="data_token"))
+
+
+def test_unknown_extra_key_rejected():
+    with pytest.raises(ValidationError):
+        McpServerInput(**_stdio(unexpected="x"))
+
+
+# ---------------------------------------------------------------------------
+# Reference maps — echoed to the owner, with vault refs as a projection
+# ---------------------------------------------------------------------------
+
+
+def test_collect_vault_refs_dedupes_and_sorts():
+    refs = collect_vault_refs({"A": "${vault:Z}", "B": "${vault:A}", "C": "literal"})
+    assert refs == ["A", "Z"]
+
+
+def _catalog_row(**overrides):
+    row = {
+        # The plugin LEFT JOIN is part of every catalog SELECT, so a real row
+        # always carries these two, NULL when it has no plugin owner.
+        "plugin_name": None,
+        "plugin_enabled": None,
+        "name": "remote_server",
+        "transport": "http",
+        "command": None,
+        "args": [],
+        "url": "https://api.example.com/mcp",
+        "env": {},
+        "headers": {"Authorization": "${vault:API_KEY}", "X-Trace": "literal-value"},
+        "description": "d",
+        "instruction": "i",
+        "tool_exposure_mode": "summary",
+        "probe_kicked_at": "2026-01-02T03:04:05+00:00",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_catalog_row_response_echoes_maps_verbatim():
+    """The owner's stored values round-trip, mixed refs and literals alike.
+
+    A PUT replaces the whole row and the edit form hydrates from these maps, so
+    a response that surfaced only ``header_refs`` would turn every unrelated
+    edit into a silent wipe of the literal entries.
+    """
+    resp = catalog_row_to_response(_catalog_row())
+    assert resp.headers == {
+        "Authorization": "${vault:API_KEY}",
+        "X-Trace": "literal-value",
+    }
+    # …and the refs stay a projection over the same map, not a replacement.
+    assert resp.header_refs == ["API_KEY"]
+    assert resp.env == {} and resp.env_refs == []
+
+
+def test_catalog_row_response_echoes_stdio_env():
+    resp = catalog_row_to_response(
+        _catalog_row(
+            transport="stdio",
+            command="npx",
+            url=None,
+            headers={},
+            env={"API_TOKEN": "${vault:API_KEY}", "REGION": "us-east-1"},
+        )
+    )
+    assert resp.env == {"API_TOKEN": "${vault:API_KEY}", "REGION": "us-east-1"}
+    assert resp.env_refs == ["API_KEY"]
+    assert resp.headers == {} and resp.header_refs == []
+
+
+def test_catalog_row_response_tolerates_null_maps():
+    resp = catalog_row_to_response(_catalog_row(env=None, headers=None))
+    assert resp.env == {} and resp.headers == {}
+    assert resp.env_refs == [] and resp.header_refs == []
+
+
+def test_catalog_row_response_carries_the_probe_kick_clock():
+    # The page tells "checking..." from "nothing ever reached this row" with
+    # it, and both leave ``probe`` null.
+    from datetime import datetime, timezone
+
+    resp = catalog_row_to_response(_catalog_row())
+    assert resp.probe_kicked_at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    assert catalog_row_to_response(_catalog_row(probe_kicked_at=None)).probe_kicked_at is None
+
+
+# ---------------------------------------------------------------------------
+# Standard `mcpServers` JSON parser
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_mcp_name_underscores_illegal_chars():
+    name, renamed = coerce_mcp_name("my-stock-mcp.v2")
+    assert name == "my_stock_mcp_v2" and renamed is True
+
+
+def test_coerce_mcp_name_prefixes_leading_digit():
+    name, renamed = coerce_mcp_name("3rd-party")
+    assert name == "_3rd_party" and renamed is True
+
+
+def test_coerce_mcp_name_passthrough_when_already_legal():
+    name, renamed = coerce_mcp_name("already_ok")
+    assert name == "already_ok" and renamed is False
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("class", "class_server"),
+        ("mcp_client", "mcp_client_server"),
+        ("mcp-client", "mcp_client_server"),
+        ("__init__", "init__"),
+        ("__class", "class_server"),
+        ("__3d", "_3d"),
+        ("---", "server"),
+    ],
+)
+def test_coerce_mcp_name_renames_what_the_sandbox_reserves(raw, expected):
+    # Import and plugin install rename rather than drop the entry, and what
+    # they produce has to pass the same check a hand-typed name does.
+    name, renamed = coerce_mcp_name(raw)
+    assert (name, renamed) == (expected, True)
+    assert sandbox_name_error(name) is None
+
+
+@pytest.mark.parametrize("raw", ["match", "type", "_"])
+def test_coerce_mcp_name_keeps_a_soft_keyword(raw):
+    assert coerce_mcp_name(raw) == (raw, False)
+
+
+def test_coerce_mcp_name_counts_an_astral_character_once():
+    # One code point, one underscore: the web preview has to agree.
+    assert coerce_mcp_name("rocket\U0001F680mcp") == ("rocket_mcp", True)
+
+
+def test_parse_reports_a_reserved_key_as_renamed():
+    [entry] = parse_mcp_servers_payload(
+        {"mcpServers": {"class": {"command": "npx", "args": ["-y", "pkg"]}}}
+    )
+    assert entry.error is None
+    assert (entry.original_name, entry.name, entry.renamed) == (
+        "class", "class_server", True,
+    )
+    assert entry.config["name"] == "class_server"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("streamablehttp", "http"),
+        ("streamable-http", "http"),
+        ("streamable_http", "http"),
+        ("streamableHttp", "http"),
+        ("http", "http"),
+        ("sse", "sse"),
+        ("stdio", "stdio"),
+    ],
+)
+def test_normalize_transport_aliases(raw, expected):
+    assert normalize_transport(raw, has_command=False, has_url=True) == expected
+
+
+def test_normalize_transport_infers_from_fields():
+    assert normalize_transport(None, has_command=True, has_url=False) == "stdio"
+    assert normalize_transport(None, has_command=False, has_url=True) == "http"
+    assert normalize_transport(None, has_command=False, has_url=False) is None
+    assert normalize_transport("nonsense", has_command=False, has_url=True) is None
+
+
+def test_parse_unwraps_mcp_servers_and_maps_remote():
+    blob = {
+        "mcpServers": {
+            "my-stock-mcp": {
+                "type": "streamablehttp",
+                "url": "https://api.example.com/ds/stock",
+                "headers": {"Authorization": "EXAMPLE-OPAQUE-TOKEN"},
+            }
+        }
+    }
+    [entry] = parse_mcp_servers_payload(blob)
+    assert entry.error is None
+    assert entry.original_name == "my-stock-mcp"
+    assert entry.name == "my_stock_mcp" and entry.renamed is True
+    assert entry.config["transport"] == "http"
+    assert entry.config["url"] == "https://api.example.com/ds/stock"
+    # Literal secret stays inline for the endpoint to extract.
+    assert entry.config["headers"] == {"Authorization": "EXAMPLE-OPAQUE-TOKEN"}
+    # The original config feeds a valid McpServerInput once the literal is vaulted.
+    server = McpServerInput(
+        **{**entry.config, "headers": {"Authorization": "${vault:TOK}"}}
+    )
+    assert server.transport == "http"
+
+
+def test_parse_infers_stdio_from_command_and_drops_unknown_keys():
+    blob = {"mcpServers": {"local_time": {"command": "uvx", "args": ["pkg"], "disabled": True}}}
+    [entry] = parse_mcp_servers_payload(blob)
+    assert entry.config["transport"] == "stdio"
+    assert entry.config["command"] == "uvx"
+    assert "disabled" not in entry.config  # unknown keys dropped on purpose
+
+
+def test_parse_bare_map_without_wrapper():
+    blob = {"srv_a": {"command": "npx"}, "srv_b": {"url": "https://api.example.com/m"}}
+    entries = {e.name: e for e in parse_mcp_servers_payload(blob)}
+    assert entries["srv_a"].config["transport"] == "stdio"
+    assert entries["srv_b"].config["transport"] == "http"
+
+
+def test_parse_single_self_naming_object():
+    blob = {"name": "solo", "command": "node", "args": ["x"]}
+    [entry] = parse_mcp_servers_payload(blob)
+    assert entry.name == "solo" and entry.config["transport"] == "stdio"
+
+
+def test_parse_undetermined_transport_marks_error():
+    blob = {"mcpServers": {"weird": {"foo": "bar"}}}
+    [entry] = parse_mcp_servers_payload(blob)
+    assert entry.error is not None and not entry.config
+
+
+def test_parse_non_dict_payload_is_empty():
+    assert parse_mcp_servers_payload("not a dict") == []
+    assert parse_mcp_servers_payload(None) == []
+
+
+# ---------------------------------------------------------------------------
+# Probe verdict: one typed field, projected from the snapshot's last_probe
+# ---------------------------------------------------------------------------
+
+
+def test_the_verdict_survives_a_snapshot_that_still_serves_its_old_tools():
+    """The blocker this field exists for. The snapshot keeps its ``ok`` status
+    and its cached tools on a same-config failure, which is right for serving
+    them and wrong as the probe's last word, so the two now travel separately."""
+    resp = catalog_row_to_response(
+        _catalog_row(),
+        snapshot={
+            "status": "ok",
+            "tools": [{"name": "quote"}],
+            "last_probe": {
+                "verdict": "credential_rejected",
+                "error": "401 Unauthorized",
+                "http_status": 401,
+            },
+        },
+    )
+
+    assert resp.tool_count == 1
+    assert resp.probe.verdict == "credential_rejected"
+    assert resp.probe.http_status == 401
+
+
+def test_a_row_nothing_has_probed_reports_no_verdict_at_all():
+    """None, not a placeholder word: the UI gates its warning on the verdict,
+    and an invented "ok" for an unprobed row is the same bug in reverse."""
+    assert catalog_row_to_response(_catalog_row()).probe is None
+    assert (
+        catalog_row_to_response(_catalog_row(), snapshot={"status": "pending"}).probe
+        is None
+    )
+
+
+def test_a_verdict_this_build_no_longer_publishes_reads_as_unprobed():
+    """Stored jsonb outlives the vocabulary that wrote it; a listing must not
+    fail over one stale row."""
+    resp = catalog_row_to_response(
+        _catalog_row(), snapshot={"status": "ok", "last_probe": {"verdict": "legacy"}}
+    )
+
+    assert resp.probe is None
+
+
+def test_the_catalog_projection_never_carries_probe_tools():
+    """The row already reports ``tool_count`` from its snapshot. Tools inside
+    the verdict are the add form's preview and would be a second, divergent
+    answer on every listing."""
+    resp = catalog_row_to_response(
+        _catalog_row(),
+        snapshot={"status": "ok", "tools": [{"name": "quote"}], "last_probe": {
+            "verdict": "ok", "tools": [{"name": "stale"}]
+        }},
+    )
+    assert resp.probe.tools == []
+
+    assert resp.probe.verdict == "ok"
+    assert resp.tool_count == 1
+
+
+def test_probe_input_rejects_a_transport():
+    """The probe dials streamable HTTP whatever the form intends to save, so a
+    transport was never read. Forbidden rather than ignored, because a client
+    still sending one is describing a choice this endpoint does not have."""
+    with pytest.raises(ValidationError):
+        ProbeInput(url="https://api.example.com/mcp", transport="sse")
+
+
+def test_probe_input_accepts_the_workspace_an_earlier_form_sends():
+    """A page loaded from the previous web build still sends one, and a 422
+    there would break the add form until the page reloads."""
+    parsed = ProbeInput(url="https://api.example.com/mcp", workspace_id="ws-1")
+
+    assert parsed.url == "https://api.example.com/mcp"
+
+
+def test_probe_input_keeps_the_fields_the_route_does_read():
+    parsed = ProbeInput(
+        url="https://api.example.com/mcp",
+        headers={"Authorization": "${vault:API_KEY}"},
+    )
+
+    assert parsed.headers == {"Authorization": "${vault:API_KEY}"}
+
+
+def test_the_verdict_vocabulary_matches_the_client_copy():
+    """The client keys two exhaustive tables off its own copy of the union,
+    so a verdict added on this side alone would compile there and render as a
+    failure; the two copies have to move together."""
+    import re
+    from pathlib import Path
+    from typing import get_args
+
+    from src.server.models.mcp_server import ProbeVerdict
+
+    # Anchored to this file, not the CWD: a scoped run from anywhere else
+    # would skip the parity check by failing to find the client copy.
+    repo = Path(__file__).resolve().parents[4]
+    source = (repo / "web/src/pages/ChatAgent/utils/api/mcp.ts").read_text()
+    block = source.split("export type ProbeVerdict =", 1)[1].split(";", 1)[0]
+    assert set(re.findall(r"'([a-z_]+)'", block)) == set(get_args(ProbeVerdict))

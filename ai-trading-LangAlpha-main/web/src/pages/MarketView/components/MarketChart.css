@@ -1,0 +1,592 @@
+.market-chart-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--color-bg-card);
+  position: relative;
+  overflow: hidden;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+  /* Mask chart until layout stabilizes after page transition (autoSize ResizeObserver).
+     motion-exempt: the delay is a wait, not motion */
+  animation: chart-reveal 0s 180ms both;
+}
+
+.chart-subrow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-height: 30px;
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--color-border-default);
+  flex-shrink: 0;
+}
+
+.chart-toolbar-trail {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* The lead is the one thing in the row that gives. It sits at a basis of 0
+   and grows to its content, so the row breaks lines on the two groups' own
+   widths and hands the lead whatever is left; short of room the lead is cut
+   with an ellipsis, and the controls never paint over each other. The tier
+   logic reads its scrollWidth, which stays the content width when clipped. */
+.chart-toolbar-lead {
+  display: block;
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: max-content;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Beside a ticker legend (`chart--with-lead`) the intervals are text, not a
+   segmented control: the legend already reads at toolbar weight, and a filled
+   track and pill made the picker the heaviest thing in the row. Without the
+   track the choice still has to read as one, so a divider sets the group
+   apart from the readouts, the selected interval is underlined like a tab,
+   and hover brings back a light fill. Only the intervals group changes: the
+   Light / Advanced switch shares `.interval-selector` and keeps its track. */
+.chart--with-lead .interval-selector--intervals {
+  background: none;
+  padding: 0 0 0 8px;
+  margin-left: 4px;
+  gap: 2px;
+  border-left: 1px solid var(--color-border-default);
+  border-radius: 0;
+}
+
+.chart--with-lead .interval-selector--intervals .interval-btn,
+.chart--with-lead .interval-selector--intervals .interval-btn-active {
+  background: none;
+  padding: 4px 6px;
+}
+
+.chart--with-lead .interval-selector--intervals .interval-btn:hover {
+  background: var(--color-bg-hover);
+}
+
+.chart--with-lead .interval-selector--intervals .interval-btn-active {
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 5px;
+}
+
+@keyframes chart-reveal {
+  from { visibility: hidden; }
+  to   { visibility: visible; }
+}
+
+/* The mask's delay is the settle wait, not motion, so it outlasts the global
+   reduced-motion rule that cuts delays. */
+@media (prefers-reduced-motion: reduce) {
+  .market-chart-container {
+    /* motion-exempt: the delay is a wait, not motion */
+    animation-delay: 180ms !important;
+  }
+}
+
+/* Capture wheel over chart so K-line pan/zoom doesn't scroll the page */
+.chart-wheel-capture {
+  overflow: hidden;
+}
+
+
+.chart-mode-switcher {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chart-indicators {
+  display: flex;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.indicator-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.6875rem;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.indicator-color {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+/* The two groups keep their natural widths; when they cannot share the row
+   the right one wraps beneath rather than over the left, which is the last
+   guard under the collapse tiers. */
+.chart-tools {
+  padding: 8px 20px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 4px;
+  border-bottom: 1px solid var(--color-border-default);
+  flex-shrink: 0;
+  position: relative;
+  z-index: 10;
+}
+
+.chart-tools-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  overflow: visible;
+}
+
+.indicator-toggles {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.indicator-toggles-label {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-right: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.indicator-toggle-btn {
+  padding: 2px 8px;
+  font-size: 0.6875rem;
+  font-weight: 500;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out);
+}
+
+.indicator-toggle-btn:hover {
+  color: var(--color-text-primary);
+}
+
+.indicator-toggle-active {
+  border-color: currentColor;
+}
+
+.interval-selector {
+  display: flex;
+  gap: 2px;
+  background-color: var(--color-bg-surface);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.interval-btn {
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Quiet segmented control: the selected chip is a plain card surface lifted out
+   of the track, not an accent fill — the amber is reserved for annotations. */
+.interval-btn:hover { color: var(--color-text-primary); background: var(--color-bg-hover); }
+.interval-btn-active { color: var(--color-text-primary); background: var(--color-bg-card); font-weight: 600; }
+.interval-btn-active:hover { color: var(--color-text-primary); background: var(--color-bg-card); }
+.interval-btn-disabled { opacity: 0.4; cursor: not-allowed; }
+
+.interval-disabled-tooltip {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  white-space: nowrap;
+  font-size: 0.6875rem;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: var(--color-bg-elevated);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border-elevated);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  z-index: 20;
+  pointer-events: none;
+  animation: tooltip-fade-in var(--motion-quick) var(--ease-out);
+}
+
+@keyframes tooltip-fade-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.chart-tools-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.chart-tool-buttons { display: flex; gap: 4px; flex-shrink: 0; }
+
+.chart-tool-btn {
+  min-width: 28px;
+  height: 28px;
+  padding: 0 6px;
+  background-color: var(--color-bg-surface);
+  border: 1px solid var(--color-border-elevated);
+  border-radius: 4px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out);
+  white-space: nowrap;
+}
+
+.chart-tool-btn:hover {
+  background-color: var(--color-bg-hover);
+  color: var(--color-text-primary);
+  border-color: var(--color-border-input);
+}
+
+/* An armed tool is marked by an accent hairline, never an accent wash. */
+.chart-tool-btn-active {
+  background-color: var(--color-bg-hover);
+  color: var(--color-text-primary);
+  border-color: var(--color-accent-primary);
+}
+
+/* "Clear annotations" toolbar button — a chart-tool-btn that carries an icon
+   plus a label, shown in the tools row only while agent annotations are drawn. */
+.chart-tool-btn.chart-clear-annotations-btn {
+  gap: 4px;
+}
+
+/* Light chart visible in Light mode: fills parent flex column */
+.light-chart-visible {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Light chart hidden behind Advanced mode: keeps layout for screenshot capture */
+.light-chart-hidden {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: -1;
+}
+
+.charts-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chart-wrapper {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+  width: 100%;
+  overflow: hidden;
+}
+
+.chart-loading,
+.chart-error {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 20px;
+  background-color: var(--color-bg-elevated);
+  border-radius: 8px;
+  color: var(--color-text-primary);
+  z-index: 10;
+}
+
+.chart-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.8125rem;
+}
+
+.chart-scroll-loading {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 5;
+  pointer-events: none;
+}
+
+.chart-error {
+  color: var(--color-loss);
+  max-width: 80%;
+  text-align: center;
+  line-height: 1.5;
+  word-wrap: break-word;
+}
+
+.chart-error-title {
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+/* ===== Toolbar dropdowns ===== */
+.toolbar-dropdown {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.toolbar-dropdown-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 50;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-elevated);
+  border-radius: 8px;
+  padding: 12px;
+  min-width: 220px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.toolbar-dropdown-panel--right {
+  left: auto;
+  right: 0;
+  min-width: 0;
+}
+
+.dropdown-section {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dropdown-section .indicator-toggles-label {
+  min-width: 48px;
+}
+
+.dropdown-tool-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px;
+}
+
+/* Interval "More" dropdown */
+.interval-dropdown-panel {
+  min-width: 0;
+  padding: 4px;
+  gap: 2px;
+}
+
+.interval-dropdown-item {
+  padding: 5px 16px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
+}
+
+.interval-dropdown-item:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+
+.interval-dropdown-item-active {
+  color: var(--color-text-primary);
+  background: var(--color-bg-surface);
+  font-weight: 600;
+}
+
+.interval-dropdown-item-active:hover {
+  background: var(--color-bg-surface);
+}
+
+/* ===== Responsive toolbar: progressive collapse by toolbar width =====
+   Cumulative tiers (chart--c1 ⊂ c2 ⊂ c3 ⊂ c4 ⊂ c5), one per breakpoint of
+   `TOOLBAR_WIDTH_BREAKPOINTS` (1180, 880, 710, 560, 300px of the container
+   net of a host's lead and trail slots), sacrifice items least-important
+   first: indicator values → scale/view tools → indicators + tools dropdowns →
+   the mode switch and Clear's label → the primary intervals. Clear and the
+   selection tools always stay inline; collapsed actionable items move into
+   the overflow menu, which the component only renders from tier 2 on. */
+
+/* Tier 1: drop the read-only indicator values. */
+.chart--c1 .toolbar-item--values { display: none; }
+
+/* Tier 2: collapse the scale / view buttons into the overflow menu + tighten. */
+.chart--c2 .chart-tools { padding: 8px 12px; }
+.chart--c2 .chart-tools-left { gap: 8px; }
+.chart--c2 .chart-tools-right { gap: 6px; }
+.chart--c2 .toolbar-item--view { display: none; }
+
+/* Tier 3: collapse the indicators + tools dropdowns into the menu too. */
+.chart--c3 .toolbar-item--indicators,
+.chart--c3 .toolbar-item--tools { display: none; }
+
+/* Tier 4 (phone): tuck the Light/Advanced switch into the menu and drop the
+   Clear button's label so it goes icon-only. Keeps the interval selector, Clear
+   and the selection tools on a single row at the narrowest widths. The mode
+   switch is only tagged collapsible in Light mode, so the required TradingView
+   attribution (Advanced mode) is never hidden. */
+.chart--c4 .toolbar-item--mode { display: none; }
+.chart--c4 .chart-clear-annotations-btn .clear-label { display: none; }
+
+/* Tier 5 (under 300px, a lead slot taking most of a narrow row): the
+   component folds the primary intervals into their dropdown, so the picker is
+   one button. No rule here; the component renders the fold. */
+
+.compact-menu-panel { min-width: 240px; }
+.compact-menu-section-label {
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-tertiary);
+}
+
+/* Tracking spaces Latin capitals; it only pulls Chinese characters apart. */
+:lang(zh) .indicator-toggles-label,
+:lang(zh) .compact-menu-section-label {
+  letter-spacing: normal;
+}
+.compact-menu-divider {
+  height: 1px;
+  background: var(--color-border-default);
+  margin: 2px 0;
+}
+.compact-menu-view-grid { grid-template-columns: repeat(3, 1fr); }
+
+/* Mobile: compact menu stretches under toolbar, tighter spacing */
+@media (max-width: 767px) {
+  .toolbar-dropdown.toolbar-item--menu {
+    position: static;
+  }
+  .compact-menu-panel {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 100%;
+    min-width: 0;
+    width: 100%;
+    padding: 8px 12px;
+    gap: 6px;
+    border-radius: 0 0 8px 8px;
+  }
+  .compact-menu-panel .dropdown-tool-grid {
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+  }
+  .compact-menu-panel .compact-menu-view-grid {
+    grid-template-columns: repeat(6, 1fr);
+    gap: 4px;
+  }
+}
+
+/* Hide the lightweight-charts watermark only. MUST NOT match the TradingView
+ * embed-widget attribution link (class `.tv-attribution`, rendered by
+ * `TradingViewEmbed`) — that link is required visible per TV's embed terms.
+ * The lightweight-charts watermark is an <a> whose href always contains
+ * `utm_medium=lwc-link`; the class selector is a secondary safety net. */
+.chart-wrapper a[href*="utm_medium=lwc-link"],
+.tv-lightweight-charts__watermark {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* ---- Bottom bar: viewing-window presets + venue clock (TradingView-style) ---- */
+.chart-bottom-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 10px;
+  border-top: 1px solid var(--color-border-default);
+  background-color: var(--color-bg-card);
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.chart-range-selector {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.chart-range-selector::-webkit-scrollbar { display: none; }
+
+.range-btn {
+  padding: 3px 8px;
+  font-size: 0.6875rem;
+  font-weight: 500;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
+  white-space: nowrap;
+}
+.range-btn:hover { color: var(--color-text-primary); background: var(--color-bg-hover); }
+.range-btn-active { color: var(--color-text-primary); font-weight: 700; }
+.range-btn-active:hover { background: transparent; color: var(--color-text-primary); }
+
+.venue-clock {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 0.6875rem;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.venue-clock-offset { opacity: 0.7; }

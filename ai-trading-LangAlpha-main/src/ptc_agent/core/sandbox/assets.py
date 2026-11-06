@@ -1,0 +1,1534 @@
+"""Sandbox asset & skills sync — manifests, hashing, uploads, pruning.
+
+Functions take the owning ``PTCSandbox`` as their explicit first argument;
+``PTCSandbox`` exposes same-name delegators, so call sites and patch
+semantics are unchanged.
+"""
+
+import asyncio
+import hashlib
+import json
+import shlex
+import time
+from secrets import token_hex
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+import structlog
+
+from src.observability import (
+    safe_record,
+    sandbox_asset_sync_phase_duration_ms,
+    sandbox_asset_sync_total_ms,
+)
+
+from ptc_agent.core.sandbox.migration import (
+    CURRENT_LAYOUT_VERSION,
+    run_layout_migrations,
+)
+from ptc_agent.core.sandbox.retry import RetryPolicy
+
+from ..paths import SandboxLayout
+
+from ..mcp_sanitize import (
+    discovery_affecting_payload,
+)
+from ..tool_generator import MCP_CLIENT_CODEGEN_VERSION
+from ..project_context import ProjectContext, current_project
+from .tool_overlay import read_union_ledger
+from .tree_upload import upload_tree
+from .vault_helper import VAULT_MODULE_SOURCE
+from ptc_agent.core.sandbox._shared import (
+    _LOCK_VOLATILE_KEYS,
+    _MCP_SHARED_RUNTIME_FILES,
+    SyncResult,
+    _sha256_file,
+    _hash_dict,
+    _internal_package_files,
+    _resolve_local_path,
+    _resolve_disabled_skills,
+)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+
+logger = structlog.get_logger(__name__)
+
+_ASSET_SYNC_CONTEXT: ContextVar[
+    tuple[Any, tuple[Any, ...] | None, Mapping[str, str] | None] | None
+] = ContextVar("asset_sync_context", default=None)
+
+
+@contextmanager
+def asset_sync_context(
+    *,
+    mcp_registry: Any,
+    mcp_servers: tuple[Any, ...] | None,
+    vault_secrets: Mapping[str, str] | None,
+):
+    token = _ASSET_SYNC_CONTEXT.set((mcp_registry, mcp_servers, vault_secrets))
+    try:
+        yield
+    finally:
+        _ASSET_SYNC_CONTEXT.reset(token)
+
+
+def _canonical_vault_json(secrets: Mapping[str, str]) -> bytes:
+    return json.dumps(
+        dict(secrets), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+@asynccontextmanager
+async def _tool_sync_context(
+    sandbox: "PTCSandbox",
+    *,
+    mcp_registry: Any = None,
+    mcp_servers: tuple[Any, ...] | None = None,
+) -> AsyncIterator[None]:
+    async with sandbox._tool_refresh_lock:
+        previous_registry = sandbox.mcp_registry
+        previous_servers = sandbox.config.mcp.servers
+        if mcp_registry is not None:
+            sandbox.mcp_registry = mcp_registry
+        if mcp_servers is not None:
+            sandbox.config.mcp.servers = list(mcp_servers)
+        try:
+            yield
+        finally:
+            sandbox.mcp_registry = previous_registry
+            sandbox.config.mcp.servers = previous_servers
+
+
+#: What :func:`_read_vault_digest` returns when the file could not be read:
+#: equal to no digest, so the file is written again rather than trusted.
+_VAULT_UNREADABLE = ""
+
+
+async def _read_vault_digest(sandbox: "PTCSandbox") -> str | None:
+    """sha256 of the root vault file as it sits on disk; None when absent.
+
+    The file is the truth, not a digest recorded beside it: the earlier
+    version writes the same path while it drains, and anything with a shell
+    can remove it, and either leaves a recorded digest describing a file that
+    is not there.
+    """
+    assert sandbox.runtime is not None
+    path = shlex.quote(sandbox.layout.vault_secrets)
+    result = await sandbox._runtime_call(
+        sandbox.runtime.exec,
+        f"if [ ! -e {path} ]; then echo absent; "
+        f"elif command -v sha256sum >/dev/null 2>&1; then sha256sum {path}; "
+        # A macOS machine may have only shasum, which prints the same line.
+        f"else shasum -a 256 {path}; fi",
+        retry_policy=RetryPolicy.SAFE,
+    )
+    words = (result.stdout or "").split() if result.exit_code == 0 else []
+    if words[:1] == ["absent"]:
+        return None
+    if words and len(words[0]) == 64:
+        return words[0]
+    return _VAULT_UNREADABLE
+
+
+async def _publish_changed_vault(
+    sandbox: "PTCSandbox",
+    vault_secrets: Mapping[str, str] | None,
+    on_disk: str | None,
+) -> bool:
+    """Rewrite the root vault file unless it holds this content; True when it did.
+
+    ``None`` is a caller with nothing to say about the vault. ``on_disk`` is
+    :func:`_read_vault_digest`'s answer.
+    """
+    if vault_secrets is None:
+        return False
+    content = _canonical_vault_json(vault_secrets)
+    # No file rather than an empty one, so vault.list_names() is [].
+    wanted = hashlib.sha256(content).hexdigest() if vault_secrets else None
+    if on_disk == wanted:
+        return False
+    assert sandbox.runtime is not None
+    path = sandbox.layout.vault_secrets
+    if vault_secrets:
+        await sandbox._runtime_call(
+            sandbox.runtime.upload_file,
+            content,
+            path,
+            retry_policy=RetryPolicy.SAFE,
+        )
+    else:
+        await sandbox._runtime_call(
+            sandbox.runtime.exec,
+            f"rm -f {shlex.quote(path)}",
+            retry_policy=RetryPolicy.SAFE,
+        )
+    return True
+
+
+async def _no_vault_digest() -> None:
+    return None
+
+
+async def publish_vault_secrets(
+    sandbox: "PTCSandbox", vault_secrets: Mapping[str, str]
+) -> bool:
+    """Publish the root vault file unless it already holds this content."""
+    await sandbox._wait_ready()
+    async with sandbox._tool_refresh_lock:
+        return await _publish_changed_vault(
+            sandbox, vault_secrets, await _read_vault_digest(sandbox)
+        )
+
+
+def _compute_tool_schema_hash(sandbox: "PTCSandbox") -> str:
+    """Hash the current MCP tool schemas from the live registry.
+
+    Captures tool names + input schemas so that adding/removing/modifying
+    a tool on a running MCP server is detected even if the .py file is unchanged.
+    """
+    if not sandbox.mcp_registry:
+        return ""
+    all_tools = sandbox.mcp_registry.get_all_tools()
+    parts: list[str] = []
+    for server_name in sorted(all_tools):
+        for tool in sorted(all_tools[server_name], key=lambda t: t.name):
+            parts.append(
+                f"{server_name}:{tool.name}:{json.dumps(tool.input_schema, sort_keys=True)}"
+            )
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def _compute_builtin_remote_config_hash(sandbox: "PTCSandbox") -> str:
+    """Hash what a remote built-in's generated entry carries, never its headers.
+
+    A built-in reached by URL ships no server file and its tools can be
+    unchanged, so nothing else moves when its URL or ``auth`` is edited, and a
+    warm sandbox would keep dialing the old endpoint. Headers stay out: they are
+    host-side discovery credentials the entry never carries. Returns "" when
+    there are none, so a stdio-only workspace's manifest is unchanged.
+    """
+    parts = [
+        json.dumps(
+            {
+                "name": server.name,
+                "transport": server.transport,
+                "url": server.url or "",
+                "auth": getattr(server, "auth", None),
+            },
+            sort_keys=True,
+        )
+        for server in sorted(sandbox._builtin_servers(), key=lambda s: s.name)
+        if server.enabled and server.transport != "stdio"
+    ]
+    if not parts:
+        return ""
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def _compute_user_mcp_config_hash(sandbox: "PTCSandbox") -> str:
+    """Hash untrusted (non-builtin) server CONFIG, never secrets.
+
+    Captures transport/command/args/url, the full env/header maps (literal
+    values AND ``${vault:NAME}`` ref strings — the stored values are never
+    resolved secrets), the effective secret-less-discovery decision, and
+    whether the server is relay-bound, so a config-only edit — a literal
+    ``MODE=prod`` -> ``staging`` change, a new authenticated header, a
+    vault-ref retarget under the same key, or a first OAuth connect — always
+    re-uploads the regenerated ``mcp_client.py``. Builds on
+    :func:`discovery_affecting_payload` (the per-server discovery-cache key)
+    and adds exactly one field it must never carry — see below. Returns ""
+    when there are no user servers so builtin-only workspaces are untouched.
+    """
+    user_servers = sandbox._user_servers()
+    if not user_servers:
+        return ""
+
+    parts: list[str] = []
+    for server in sorted(user_servers, key=lambda s: s.name):
+        payload = discovery_affecting_payload(server, include_identity=True)
+        # Deliberate asymmetry with the discovery fingerprint: the two hashes
+        # serve different invalidation domains. Codegen branches on the binding
+        # — a bound server is emitted as a relay entry with url and headers
+        # dropped — so this hash must move when it flips. The vendor's
+        # tools/list answer does NOT depend on it, and binding state entering
+        # discovery_affecting_payload would leave every OAuth server's snapshot
+        # stale forever (pinned by test_ignores_the_resolve_time_oauth_binding
+        # in tests/unit/server/services/test_mcp_discovery.py).
+        #
+        # The BOOL, not the id: codegen only tests is-not-None, while the id
+        # rotates on every reconnect and would force uploads that change
+        # nothing. Written only when bound, so an unbound workspace's hash stays
+        # byte-identical to a pre-binding sandbox and never re-uploads.
+        if getattr(server, "oauth_connection_id", None):
+            payload["oauth_bound"] = True
+        parts.append(json.dumps(payload, sort_keys=True))
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+async def _compute_skills_module(
+    sandbox: "PTCSandbox",
+    skill_roots: list[str],
+    *,
+    managed_root: str | None = None,
+    disabled: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Compute a skills module manifest with content-based SHA-256 hashing.
+
+    Unlike the legacy ``_compute_skills_manifest`` (size+mtime), this hashes
+    actual file contents so the manifest is deterministic and portable.
+
+    ``managed_root`` marks which root holds the server-managed user tier —
+    its skills get ``owner:"user"`` / ``sourceType:MANAGED_SOURCE_TYPE``
+    lock entries so the sync may replace/prune them while the agent's own
+    installs stay protected. ``disabled`` names are excluded entirely, so
+    a disabled builtin leaves the local set (and hence the sandbox).
+    """
+    disabled = _resolve_disabled_skills(disabled)
+
+    skills_base = SandboxLayout(sandbox._work_dir).skills
+
+    def build() -> dict[str, Any]:
+        from ptc_agent.agent.middleware.skills import skills_outside_sandbox
+        from ptc_agent.agent.middleware.skills.discovery import (
+            parse_skill_metadata,
+        )
+
+        outside_sandbox = skills_outside_sandbox()
+
+        files: dict[str, str] = {}  # rel_path → sha256
+        skills_metadata: dict[str, dict[str, Any]] = {}
+        seen_skill_names: set[str] = set()
+
+        for root_str in skill_roots:
+            root = Path(root_str).expanduser()
+            if not root.exists():
+                continue
+            is_managed_root = managed_root is not None and root_str == managed_root
+
+            for skill_dir in root.iterdir():
+                if not skill_dir.is_dir():
+                    continue
+                if not (skill_dir / "SKILL.md").exists():
+                    continue
+
+                skill_name = skill_dir.name
+                if skill_name in disabled:
+                    continue
+                # Skip registry skills the sandbox does not get
+                if skill_name in outside_sandbox:
+                    continue
+
+                # Later sources override earlier ones
+                if skill_name in seen_skill_names:
+                    prefix = f"{skill_name}/"
+                    files = {k: v for k, v in files.items() if not k.startswith(prefix)}
+                seen_skill_names.add(skill_name)
+
+                for fp in skill_dir.rglob("*"):
+                    if not fp.is_file():
+                        continue
+                    if "__pycache__" in fp.parts or fp.name == "LICENSE.txt":
+                        continue
+                    rel = f"{skill_name}/{fp.relative_to(skill_dir)}"
+                    files[rel] = _sha256_file(fp)
+
+                # Parse SKILL.md frontmatter
+                try:
+                    content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                sandbox_path = f"{skills_base}/{skill_name}/SKILL.md"
+                meta = parse_skill_metadata(content, sandbox_path, skill_name)
+                skills_metadata[skill_name] = dict(meta)
+
+                # Build lock entry: platform, or server-managed user tier
+                from ptc_agent.agent.middleware.skills.lock import (
+                    MANAGED_SOURCE_TYPE,
+                    build_lock_entry,
+                )
+
+                content_hash = f"sha256:{_sha256_file(skill_dir / 'SKILL.md')}"
+                if is_managed_root:
+                    lock_entry = build_lock_entry(
+                        meta,
+                        owner="user",
+                        source=f"user:{skill_name}",
+                        source_type=MANAGED_SOURCE_TYPE,
+                        content_hash=content_hash,
+                    )
+                else:
+                    lock_entry = build_lock_entry(
+                        meta,
+                        owner="platform",
+                        source="platform",
+                        source_type="platform",
+                        content_hash=content_hash,
+                    )
+                skills_metadata[skill_name]["lock_entry"] = dict(lock_entry)
+
+        version = _hash_dict(files)
+
+        # Include lock entries in version hash so manifest detects ownership changes.
+        # Exclude volatile timestamp fields (installedAt, updatedAt) — they change
+        # on every manifest computation and would force a full skills re-upload
+        # on every workspace restart even when no skill files changed.
+        lock_hash_parts = []
+        for name in sorted(skills_metadata):
+            entry = skills_metadata[name].get("lock_entry")
+            if entry:
+                stable = {
+                    k: v for k, v in entry.items() if k not in _LOCK_VOLATILE_KEYS
+                }
+                lock_hash_parts.append(f"{name}:{json.dumps(stable, sort_keys=True)}")
+        if lock_hash_parts:
+            lock_payload = "\n".join(lock_hash_parts)
+            combined = f"{version}\n{lock_payload}"
+            version = hashlib.sha256(combined.encode()).hexdigest()
+
+        return {"version": version, "files": files, "skills": skills_metadata}
+
+    return await asyncio.to_thread(build)
+
+
+async def _compute_sandbox_manifest(
+    sandbox: "PTCSandbox",
+    *,
+    skill_roots: list[str] | None = None,
+    managed_skill_root: str | None = None,
+    disabled_skills: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Compute the unified local manifest for the sandbox asset modules."""
+    modules: dict[str, Any] = {}
+    config_dir = getattr(sandbox.config, "config_file_dir", None)
+
+    # ── Module: mcp_servers ──
+    # Built-ins only: this module ships local ``uv run python`` server files
+    # from the host repo. User servers never ship host-local .py files, so
+    # the mcp_servers hash stays byte-identical for builtin-only workspaces.
+    mcp_files: dict[str, str] = {}  # filename → sha256
+    for server in sandbox._builtin_servers():
+        if not server.enabled:
+            continue
+        if server.transport != "stdio" or server.command != "uv":
+            continue
+        if (
+            len(server.args) < 3
+            or server.args[0] != "run"
+            or server.args[1] != "python"
+        ):
+            continue
+        resolved = _resolve_local_path(server.args[2], config_dir)
+        if resolved:
+            mcp_files[Path(resolved).name] = _sha256_file(Path(resolved))
+    if mcp_files:
+        for shared_name in _MCP_SHARED_RUNTIME_FILES:
+            shared = _resolve_local_path(f"mcp_servers/{shared_name}", config_dir)
+            if shared:
+                mcp_files[shared_name] = _sha256_file(Path(shared))
+    mcp_version = _hash_dict(mcp_files)
+    modules["mcp_servers"] = {"version": mcp_version, "files": mcp_files}
+
+    # ── Module: internal_packages (src/data_client, market_protocol) ──
+    # One module for the whole set: the upload is all-or-nothing, so a single
+    # version is the honest re-upload gate. Hashes the exact file set the
+    # upload ships (same collection helper), so nothing can drift or drop.
+    repo_root = config_dir or Path.cwd()
+    src_dir = (repo_root / "src").resolve()
+    internal_files = {
+        str(rel): _sha256_file(local)
+        for local, rel in _internal_package_files(
+            src_dir, livefs=sandbox.mounts_livefs
+        )
+    }
+    if internal_files:
+        # The vault helper ships in the same upload but is generated rather
+        # than read from a file, so its source is hashed here; otherwise an
+        # edit to it never reaches a warm sandbox.
+        internal_files["vault.py"] = hashlib.sha256(
+            VAULT_MODULE_SOURCE.encode("utf-8")
+        ).hexdigest()
+    modules["internal_packages"] = {
+        "version": _hash_dict(internal_files),
+        "files": internal_files,
+    }
+
+    # ── Module: tool_modules (derived) ──
+    tool_schema_hash = sandbox._compute_tool_schema_hash()
+    source_versions = {
+        "mcp_servers": mcp_version,
+        "tool_schemas": tool_schema_hash,
+        # Generated-client output version. Folded in unconditionally so a
+        # codegen bump (e.g. new _trace_mcp_call template) changes tm_version
+        # for EVERY workspace and re-uploads the regenerated mcp_client.py on
+        # the next sync — the manifest otherwise hashes only generation inputs.
+        "client_codegen": MCP_CLIENT_CODEGEN_VERSION,
+    }
+    # User-server config hash — GATED on the presence of user servers so a
+    # builtin-only workspace's source_versions dict (and thus tool_modules
+    # version) is byte-identical to pre-change. A config-only edit (transport
+    # /command/args/url, or any stored env/header value — refs and literals,
+    # never resolved secrets) changes this hash and so re-uploads the
+    # regenerated mcp_client.py via the tool_modules diff.
+    user_mcp_hash = sandbox._compute_user_mcp_config_hash()
+    if user_mcp_hash:
+        source_versions["user_mcp_config"] = user_mcp_hash
+    builtin_remote_hash = _compute_builtin_remote_config_hash(sandbox)
+    if builtin_remote_hash:
+        source_versions["builtin_remote_config"] = builtin_remote_hash
+    tm_version = _hash_dict(source_versions)
+    modules["tool_modules"] = {
+        "version": tm_version,
+        "source_versions": source_versions,
+    }
+
+    # ── Module: skills ──
+    if skill_roots:
+        modules["skills"] = await sandbox._compute_skills_module(
+            skill_roots, managed_root=managed_skill_root, disabled=disabled_skills
+        )
+
+    return {
+        "schema_version": 1,
+        "layout_version": CURRENT_LAYOUT_VERSION,
+        "modules": modules,
+    }
+
+
+async def _read_unified_manifest(sandbox: "PTCSandbox") -> dict[str, Any] | None:
+    """Read the unified manifest from the sandbox.
+
+    Bypasses path validation for ``_internal/``.
+    Returns None if missing, corrupt, or wrong ``schema_version``
+    (triggers full refresh in the caller). A module that is not a mapping
+    is corrupt: the diff reads each one as a mapping, and a sync that raised
+    on it would never write the file again.
+    """
+    assert sandbox.runtime is not None
+    try:
+        raw = await sandbox._runtime_call(
+            sandbox.runtime.download_file,
+            sandbox._unified_manifest_path,
+            retry_policy=RetryPolicy.SAFE,
+        )
+        if raw:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            parsed = json.loads(text)
+            if (
+                isinstance(parsed, dict)
+                and parsed.get("schema_version") == 1
+                and isinstance(modules := parsed.get("modules", {}), dict)
+                and all(isinstance(m, dict) for m in modules.values())
+            ):
+                return parsed
+    except Exception:
+        pass  # Missing file, decode error, or JSON error → full refresh
+    return None
+
+
+async def delivered_skill_names(sandbox: "PTCSandbox") -> set[str] | None:
+    """The skills the last completed sync delivered to the shared tier.
+
+    Read from the manifest, which a sync writes only once it finishes, not
+    from the tier: a sync in flight deletes and re-uploads each skill it
+    refreshes, and a failed one can leave the tier partial. A name a
+    collision kept from upload was not delivered. None when the manifest
+    cannot be read, or holds a shape no sync writes: the file sits where
+    sandbox code can rewrite it.
+    """
+    manifest = await sandbox._read_unified_manifest()
+    if manifest is None:
+        return None
+    # The reader vouches for the modules being mappings, not for their fields.
+    skills = manifest.get("modules", {}).get("skills") or {}
+    files = skills.get("files") or {}
+    collisions = skills.get("collisions") or []
+    if not isinstance(files, dict) or not (
+        isinstance(collisions, list) and all(isinstance(c, str) for c in collisions)
+    ):
+        return None
+    return {rel.partition("/")[0] for rel in files} - set(collisions)
+
+
+async def _write_unified_manifest(
+    sandbox: "PTCSandbox", manifest: dict[str, Any]
+) -> None:
+    """Write the unified manifest to the sandbox.
+
+    Bypasses path validation since ``_internal/`` is a protected directory
+    that the agent cannot access, but the system needs to write to.
+    """
+    assert sandbox.runtime is not None
+    await sandbox._runtime_call(
+        sandbox.runtime.upload_file,
+        json.dumps(manifest, sort_keys=True).encode("utf-8"),
+        sandbox._unified_manifest_path,
+        retry_policy=RetryPolicy.SAFE,
+    )
+
+
+async def _cleanup_legacy_manifests(sandbox: "PTCSandbox") -> None:
+    """Remove old per-module manifest files after migration to unified manifest."""
+    layout = SandboxLayout(sandbox._work_dir)
+    legacy_paths = [
+        layout.mcp_manifest,
+        # Pre-v2 layout: skills lived at the root before .agents/ existed.
+        f"{layout.root}/skills/.skills_manifest.json",
+        layout.skills_manifest,
+    ]
+    assert sandbox.runtime is not None
+    try:
+        rm_cmd = "rm -f " + " ".join(shlex.quote(p) for p in legacy_paths)
+        await sandbox._runtime_call(
+            sandbox.runtime.exec,
+            rm_cmd,
+            retry_policy=RetryPolicy.SAFE,
+        )
+    except Exception:
+        pass  # Best-effort cleanup
+
+
+async def _upload_mcp_server_files_impl(sandbox: "PTCSandbox") -> set[str]:
+    """Upload MCP server .py files to sandbox (pure upload, no manifest check).
+
+    Returns the filenames the directory should hold. Pruning the rest is left
+    to :func:`_prune_mcp_server_files`, once the config that stops launching
+    them is installed: the live config may still run a file this sync drops.
+    """
+    work_dir = sandbox._work_dir
+    mcp_servers_dir = f"{work_dir}/mcp_servers"
+    config_dir = getattr(sandbox.config, "config_file_dir", None)
+
+    files_to_upload: list[tuple[str, str, str]] = []
+    expected_files: set[str] = set()
+    #: sandbox filename -> the host file already staged under it.
+    claimed: dict[str, str] = {}
+
+    # Built-ins only: only built-in servers ship host-local ``uv run python``
+    # files. User servers run via npx/uvx/http and have nothing to upload here.
+    for server in sandbox._builtin_servers():
+        if not server.enabled:
+            continue
+        if server.transport == "stdio" and server.command == "uv":
+            if (
+                len(server.args) >= 3
+                and server.args[0] == "run"
+                and server.args[1] == "python"
+            ):
+                resolved = _resolve_local_path(server.args[2], config_dir)
+                if resolved:
+                    filename = Path(resolved).name
+                    sandbox_path = f"{mcp_servers_dir}/{filename}"
+                    # The sandbox is one flat directory, so the file a server
+                    # came from is gone by the time it lands: two servers that
+                    # name their entry point the same thing stage to the same
+                    # destination. Bundled servers never get this far -- a
+                    # collision between them is dropped at composition, in
+                    # bundled_mcp_servers -- so what reaches here is a server
+                    # an operator added in YAML. Skipping the upload keeps the
+                    # first server correct; the second still launches against
+                    # the surviving file, which the error names so the fix is
+                    # to rename, not to guess.
+                    if (clash := claimed.get(filename)) and clash != resolved:
+                        logger.error(
+                            "MCP server entry points collide in the sandbox: "
+                            f"{clash} and {resolved} both stage as {filename}",
+                            server=server.name,
+                        )
+                        continue
+                    claimed[filename] = resolved
+                    expected_files.add(filename)
+                    files_to_upload.append((server.name, resolved, sandbox_path))
+                else:
+                    searched = [server.args[2]]
+                    if config_dir:
+                        searched.append(str(config_dir / server.args[2]))
+                    logger.warning(
+                        f"MCP server file not found: {server.args[2]}",
+                        server=server.name,
+                        searched_paths=searched,
+                    )
+
+    # Shared runtime siblings (imported by the server files) ship alongside
+    # them; adding them to expected_files also shields them from the prune.
+    if files_to_upload:
+        for shared_name in _MCP_SHARED_RUNTIME_FILES:
+            shared = _resolve_local_path(f"mcp_servers/{shared_name}", config_dir)
+            if shared:
+                expected_files.add(shared_name)
+                files_to_upload.append(
+                    ("_shared", shared, f"{mcp_servers_dir}/{shared_name}")
+                )
+
+    assert sandbox.runtime is not None
+    runtime = sandbox.runtime
+
+    await sandbox._runtime_call(
+        runtime.exec,
+        f"mkdir -p {shlex.quote(mcp_servers_dir)}",
+        retry_policy=RetryPolicy.SAFE,
+    )
+
+    # Batch upload — single HTTP request via upload_files
+    if files_to_upload:
+        batch = [(local, remote) for _, local, remote in files_to_upload]
+        await sandbox._runtime_call(
+            runtime.upload_files,
+            batch,
+            retry_policy=RetryPolicy.SAFE,
+        )
+        for name, local, remote in files_to_upload:
+            logger.info(
+                "Uploaded MCP server file",
+                server=name,
+                local_path=local,
+                sandbox_path=remote,
+            )
+    return expected_files
+
+
+async def _prune_mcp_server_files(sandbox: "PTCSandbox", expected: set[str]) -> None:
+    """Remove server files the upload no longer ships."""
+    mcp_servers_dir = f"{sandbox._work_dir}/mcp_servers"
+    assert sandbox.runtime is not None
+
+    # Prune stale files — single rm command instead of N
+    existing_entries = await sandbox.als_directory(mcp_servers_dir)
+    if existing_entries:
+        files_to_remove = [
+            entry["path"]
+            for entry in existing_entries
+            if not entry.get("is_dir", False)
+            and entry.get("name") not in expected
+            and entry.get("name")
+            not in (".mcp_manifest.json", ".sandbox_manifest.json")
+        ]
+        if files_to_remove:
+            rm_cmd = "rm -f " + " ".join(shlex.quote(p) for p in files_to_remove)
+            await sandbox._runtime_call(
+                sandbox.runtime.exec,
+                rm_cmd,
+                retry_policy=RetryPolicy.SAFE,
+            )
+            logger.info(
+                "Pruned MCP server files",
+                removed=len(files_to_remove),
+                sandbox_root=mcp_servers_dir,
+            )
+
+
+async def sync_sandbox_assets(
+    sandbox: "PTCSandbox",
+    *,
+    skill_dirs: list[str] | None = None,
+    user_skill_dir: str | None = None,
+    disabled_skills: frozenset[str] = frozenset(),
+    reusing_sandbox: bool = False,
+    force_refresh: bool = False,
+    project: ProjectContext | None = None,
+    root_owner_dir_name: str | None = None,
+    workspace_dir_names: tuple[str, ...] = (),
+    on_progress: Callable[[str], None] | None = None,
+    mcp_registry: Any = None,
+    mcp_servers: tuple[Any, ...] | None = None,
+    vault_secrets: Mapping[str, str] | None = None,
+) -> SyncResult:
+    """Sync all sandbox assets using a single unified manifest.
+
+    Replaces the previous ``sync_tools()`` and ``sync_skills()`` methods
+    with a single entry point that tracks MCP servers, data client, tool
+    modules, and skills in one manifest file.
+
+    Args:
+        skill_dirs: Ordered host directories to deliver skills from. They
+            all land in the sandbox's own skills folder, read off its live
+            root like every other path here, so a computer whose root is not
+            the deployment default still gets them where its agent looks.
+        user_skill_dir: Host cache view of the user's server-managed skill
+            tier. A separate param, not another ``skill_dirs`` entry, because
+            the manifest computation must know which root is managed to
+            stamp the right lock ownership.
+        disabled_skills: Builtin skill names this user disabled — excluded
+            from the local set, so the prune removes them from the sandbox.
+            One an enabled skill declares in ``requires`` is kept: the
+            dependent's mandated read would otherwise miss.
+        reusing_sandbox: Whether reconnecting to an existing sandbox. Only
+            labels the sync's metrics: what is uploaded follows the sandbox's
+            manifest, which on a new sandbox records what setup put there.
+        force_refresh: Force re-upload of all modules regardless of manifest.
+        project: Which project this sync is for, carrying its id and its
+            folder on the computer. None is a machine with no project on
+            it yet, which still owns the root. The folder travels here and
+            the root does not: paths come from the sandbox's live root,
+            since a sync may run while the sandbox re-resolves it.
+        root_owner_dir_name: Folder the root's existing files belong in,
+            when that is not this project's. A computer folded from
+            several single-project sandboxes has one owner for its root,
+            and any sibling may be the one that triggers the move.
+            Defaults to the project's own folder.
+        on_progress: Optional callback for reporting progress.
+
+    Returns:
+        SyncResult with list of refreshed module names.
+    """
+    await sandbox._wait_ready()
+
+    bound = _ASSET_SYNC_CONTEXT.get()
+    if bound is not None:
+        if mcp_registry is None:
+            mcp_registry = bound[0]
+        if mcp_servers is None:
+            mcp_servers = bound[1]
+        if vault_secrets is None:
+            vault_secrets = bound[2]
+
+    # Fold the managed user tier into the source list (last, so it can never
+    # be overridden); which root is managed travels separately.
+    managed_root = user_skill_dir
+    if user_skill_dir:
+        skill_dirs = list(skill_dirs or []) + [user_skill_dir]
+
+    async with _tool_sync_context(
+        sandbox, mcp_registry=mcp_registry, mcp_servers=mcp_servers
+    ):
+        await sandbox.ensure_sandbox_ready()
+
+        _t0 = time.time()
+        _sync_phases: dict[str, float] = {}
+
+        def _mark_sync(name: str) -> None:
+            nonlocal _t0
+            now = time.time()
+            _sync_phases[name] = (now - _t0) * 1000
+            _t0 = now
+
+        # Which folder this sync is for. Taken from the argument, never from
+        # the ambient project: a sync runs at session acquisition, outside the
+        # turn that binds it, so the ContextVar is always empty here and the
+        # overlay would be built for the computer root instead.
+        project = project or ProjectContext("", "")
+        if project.dir_name is None:
+            # Downstream joins a folder name onto the root; the root owner is
+            # the only place a missing one is still a real answer.
+            project = replace(project, dir_name="")
+        dir_name = project.dir_name
+
+        # Steps 0+1+2: all three are independent — parallelize
+        # _prune_disabled_tool_modules → sandbox rm (disjoint from manifest paths)
+        # _compute_sandbox_manifest → local CPU/disk only
+        # _read_unified_manifest → sandbox HTTP GET
+        skill_roots = list(skill_dirs) if skill_dirs else None
+
+        (
+            _,
+            local_manifest,
+            remote_manifest,
+            union_ledger,
+            vault_on_disk,
+        ) = await asyncio.gather(
+            sandbox._prune_disabled_tool_modules(project=project),
+            sandbox._compute_sandbox_manifest(
+                skill_roots=skill_roots,
+                managed_skill_root=managed_root,
+                disabled_skills=disabled_skills,
+            ),
+            sandbox._read_unified_manifest(),
+            # The claim and vault reads ride along with the manifest's, so
+            # they cost no wall time.
+            read_union_ledger(sandbox, SandboxLayout(sandbox._work_dir)),
+            _read_vault_digest(sandbox)
+            if vault_secrets is not None
+            else _no_vault_digest(),
+        )
+        tool_version = local_manifest["modules"]["tool_modules"]["version"]
+        # The shared manifest may describe a sibling that discovered identical
+        # tools first. Only this project's completed install satisfies its sync.
+        overlay_missing = bool(
+            project.dir_name
+            and sandbox.mcp_registry is not None
+            and union_ledger.get("tool_versions", {}).get(project.claim)
+            != tool_version
+        )
+        _mark_sync("manifest")
+
+        # 2b. Run layout migrations if needed (zero cost when current). A
+        # missing stamp reads as the oldest layout the provider ever made, not
+        # v1, so a failed first manifest write cannot replay old moves.
+        first_layout = type(sandbox.provider).first_layout_version
+        remote_layout = max(
+            (remote_manifest or {}).get("layout_version", 1), first_layout
+        )
+        layout_version = await run_layout_migrations(
+            sandbox.runtime,
+            sandbox._work_dir,
+            remote_layout,
+            dir_name=root_owner_dir_name or dir_name or None,
+            workspace_dir_names=workspace_dir_names,
+        )
+        layout_moved = layout_version != remote_layout
+        # Only stamp after every migration succeeds; failure leaves the old
+        # manifest intact so the next acquisition retries the move.
+        local_manifest["layout_version"] = layout_version
+        await _publish_changed_vault(sandbox, vault_secrets, vault_on_disk)
+
+        # 3. Determine which modules changed (pure CPU). An unreadable manifest
+        # says nothing about the disk, so everything goes up; a readable one
+        # is diffed whoever wrote it, a new sandbox's setup included.
+        if force_refresh or remote_manifest is None:
+            changed_modules = set(local_manifest["modules"].keys())
+        else:
+            changed_modules: set[str] = set()
+            for mod_name, mod_data in local_manifest["modules"].items():
+                remote_mod = remote_manifest.get("modules", {}).get(mod_name)
+                if mod_name == "tool_modules" and project.dir_name:
+                    if overlay_missing:
+                        changed_modules.add(mod_name)
+                elif (
+                    remote_mod is None
+                    or remote_mod.get("version") != mod_data["version"]
+                ):
+                    changed_modules.add(mod_name)
+
+        if not changed_modules:
+            # `is None` guard (like the slow path): the cached manifest may
+            # already hold the merged local+agent-installed view — overwriting
+            # it with the local-only view would drop agent-installed skills
+            # from known_skills on every warm reuse.
+            if (
+                sandbox._skills_manifest is None
+                and "skills" in local_manifest["modules"]
+            ):
+                skills_mod = local_manifest["modules"]["skills"]
+                if skill_dirs:
+                    # Cold process / reconnect: one lock read folds the
+                    # agent-installed entries in without a filesystem re-scan.
+                    existing_lock = await sandbox._download_skills_lock()
+                    if existing_lock:
+                        sandbox._build_complete_skills_cache(
+                            skills_mod, {"skills": existing_lock}
+                        )
+                if sandbox._skills_manifest is None:
+                    sandbox._skills_manifest = skills_mod
+            if not (layout_moved or overlay_missing):
+                return SyncResult(
+                    refreshed_modules=[],
+                    forced=False,
+                    layout_version=layout_version,
+                )
+            # A layout migration moves files without moving a module hash, so
+            # returning here would leave the manifest stamped at the old
+            # version and re-run the migration on every later sync. A missing
+            # overlay is the same shape: a per-workspace fact no computer-wide
+            # hash can carry. Fall through: every upload below is a no-op with
+            # nothing changed, and the manifest write at the end records the
+            # new version.
+
+        refreshed: list[str] = []
+        skill_collisions: set[str] = set()
+
+        # 4. Upload changed modules
+        # Intent-based ordering: tool_modules after mcp_servers (derived from
+        # MCP definitions). All other modules write to disjoint sandbox paths
+        # and are safe to run in parallel.
+
+        async def _do_skills_upload() -> None:
+            """Skills sub-chain: collect → prune → upload (internally sequential)."""
+            local_skill_names = await _collect_local_skill_names(
+                list(skill_dirs or []),
+                disabled=disabled_skills,
+            )
+
+            # Download existing lock file once (shared by prune + upload)
+            existing_lock = await sandbox._download_skills_lock()
+
+            await sandbox._prune_remote_skills(
+                local_skill_names, existing_lock=existing_lock
+            )
+            skills_mod = local_manifest["modules"].get("skills", {})
+            if skills_mod.get("files"):
+                merged_lock, collisions = await sandbox._upload_skills(
+                    skill_dirs,
+                    manifest=skills_mod,  # type: ignore[arg-type]
+                    existing_lock=existing_lock,
+                    disabled=disabled_skills,
+                )
+                skill_collisions.update(collisions)
+                # Build complete skills cache from merged lock data
+                if merged_lock:
+                    sandbox._build_complete_skills_cache(skills_mod, merged_lock)
+
+        # Group 1: independent uploads in parallel
+        parallel_uploads: list[tuple[str, Any]] = []
+        if "mcp_servers" in changed_modules:
+            if on_progress:
+                on_progress("Syncing MCP server files...")
+            parallel_uploads.append(
+                ("mcp_servers", sandbox._upload_mcp_server_files_impl())
+            )
+        if "internal_packages" in changed_modules:
+            if on_progress:
+                on_progress("Syncing internal packages...")
+            parallel_uploads.append(
+                ("internal_packages", sandbox._upload_internal_packages())
+            )
+        if "skills" in changed_modules and skill_dirs:
+            if on_progress:
+                on_progress("Syncing skills...")
+            parallel_uploads.append(("skills", _do_skills_upload()))
+
+        mcp_expected: set[str] | None = None
+        skills_error: Exception | None = None
+        if parallel_uploads:
+            results = await asyncio.gather(
+                *[coro for _, coro in parallel_uploads], return_exceptions=True
+            )
+            for (name, _), result in zip(parallel_uploads, results):
+                if not isinstance(result, BaseException):
+                    refreshed.append(name)
+                    if name == "mcp_servers":
+                        mcp_expected = result
+                elif name == "skills" and isinstance(result, Exception):
+                    # Skills are independent of the MCP config, so their
+                    # failure waits until the config below is installed to
+                    # match the server files just uploaded.
+                    skills_error = result
+                else:
+                    # The tool modules are built on the server files and
+                    # packages, so either failing stops the sync here.
+                    raise result
+        _mark_sync("uploads")
+
+        # Group 2: tool_modules AFTER mcp_servers (intent: derived from MCP definitions)
+        if "tool_modules" in changed_modules or overlay_missing:
+            if on_progress:
+                on_progress("Regenerating tool modules...")
+            await sandbox._install_tool_modules(
+                project=project, tool_version=tool_version
+            )
+            refreshed.append("tool_modules")
+            _mark_sync("tool_modules")
+            try:
+                await sandbox._start_internal_mcp_servers()
+            except Exception as e:
+                logger.warning("Failed to refresh MCP servers", error=str(e))
+            _mark_sync("mcp_start")
+
+        # Only after the install: the config must never launch a file the
+        # sync already removed, so any failure above leaves the old ones.
+        if mcp_expected is not None:
+            await sandbox._prune_mcp_server_files(mcp_expected)
+
+        # Unwritten manifest, so the next acquire retries the skills.
+        if skills_error is not None:
+            raise skills_error
+
+        # Cache skills metadata (only if not already set by _build_complete_skills_cache,
+        # which includes user-installed skills from the lock file)
+        if sandbox._skills_manifest is None and "skills" in local_manifest["modules"]:
+            sandbox._skills_manifest = local_manifest["modules"]["skills"]
+
+        # A collision-skipped upload must not read as done: fold the skipped
+        # names into the written version so the next sync's freshly computed
+        # version (which never carries `collisions`) differs and retries.
+        # Converges once the colliding agent-installed skill is removed.
+        if skill_collisions:
+            mod = local_manifest["modules"]["skills"]
+            collision_key = ",".join(sorted(skill_collisions))
+            mod["collisions"] = sorted(skill_collisions)
+            mod["version"] = hashlib.sha256(
+                f"{mod['version']}|collisions:{collision_key}".encode()
+            ).hexdigest()
+
+        # Steps 5+6: independent — parallelize
+        await asyncio.gather(
+            sandbox._write_unified_manifest(local_manifest),
+            sandbox._cleanup_legacy_manifests(),
+        )
+        _mark_sync("finalize")
+
+        total = sum(_sync_phases.values())
+        phases = " ".join(f"{k}={v:.0f}ms" for k, v in _sync_phases.items())
+        logger.info(
+            f"[ASSET_SYNC] total={total:.0f}ms ({phases}) "
+            f"changed={','.join(sorted(refreshed)) or 'none'}"
+        )
+        # Mirror the [ASSET_SYNC] log into OTel: one phase histogram sample
+        # per bucket + a total, labeled by whether any module changed (so
+        # dashboards can split fast no-op syncs from expensive ones).
+        _reuse_label = "reuse" if reusing_sandbox else "fresh"
+        safe_record(
+            sandbox_asset_sync_total_ms,
+            total,
+            {"changed": "yes" if refreshed else "no", "sandbox": _reuse_label},
+        )
+        for _phase, _ms in _sync_phases.items():
+            safe_record(
+                sandbox_asset_sync_phase_duration_ms,
+                _ms,
+                {"phase": _phase, "sandbox": _reuse_label},
+            )
+        return SyncResult(
+            refreshed_modules=refreshed,
+            forced=force_refresh,
+            layout_version=layout_version,
+        )
+
+
+async def _prune_disabled_tool_modules(
+    sandbox: "PTCSandbox", *, project: ProjectContext | None = None
+) -> None:
+    """Withdraw a disabled server from the workspace that disabled it.
+
+    The workspace's overlay, never the computer's union: the union is shared
+    with the sibling workspaces on this computer, so deleting a wrapper there
+    would take a server away from a workspace that never disabled it. Which
+    folder that is has to be passed in by a caller that knows, because a sync
+    runs outside the turn whose project would otherwise name it.
+    """
+    if not sandbox.runtime:
+        return
+    ctx = project if project is not None else current_project()
+    claim = ctx.claim if ctx is not None else ProjectContext("", "").claim
+    # Keyed by workspace, not a bool: one sandbox serves every workspace on
+    # the computer, and a single flag let whichever workspace synced first
+    # spend the prune for all of them.
+    if claim in sandbox._disabled_modules_pruned:
+        return
+
+    runtime = sandbox.runtime
+    disabled = [
+        server.name for server in sandbox.config.mcp.servers if not server.enabled
+    ]
+    if not disabled:
+        sandbox._disabled_modules_pruned.add(claim)
+        return
+
+    workspace = sandbox.workspace(ctx)
+    paths: list[str] = [f"{workspace.tools}/{name}.py" for name in disabled]
+    # ``tools_docs`` is None for a workspace that owns the computer root, whose
+    # docs directory IS the shared union's. Deleting there would take a
+    # sibling's docs, so the root folder prunes wrappers only.
+    if workspace.tools_docs is not None:
+        paths.extend(f"{workspace.tools_docs}/{name}" for name in disabled)
+
+    async def remove_one(path: str) -> None:
+        await sandbox._runtime_call(
+            runtime.exec,
+            f"rm -rf {shlex.quote(path)}",
+            retry_policy=RetryPolicy.SAFE,
+        )
+
+    results = await asyncio.gather(
+        *[remove_one(path) for path in paths], return_exceptions=True
+    )
+    failed = [
+        (path, err) for path, err in zip(paths, results) if isinstance(err, Exception)
+    ]
+    for path, err in failed:
+        logger.warning(
+            "Could not prune disabled tool module", path=path, error=str(err)
+        )
+    if failed:
+        # Not claimed: the next sync retries the leftovers instead of leaving a
+        # disabled server's wrapper importable for the machine's life.
+        return
+    sandbox._disabled_modules_pruned.add(claim)
+    logger.debug("Pruned disabled tool modules", removed=len(paths), claim=claim)
+
+
+async def _collect_local_skill_names(
+    local_skill_roots: list[str],
+    *,
+    disabled: frozenset[str] = frozenset(),
+) -> set[str]:
+    disabled = _resolve_disabled_skills(disabled)
+
+    def build() -> set[str]:
+        from ptc_agent.agent.middleware.skills import skills_outside_sandbox
+
+        outside_sandbox = skills_outside_sandbox()
+
+        names: set[str] = set()
+        for root_str in local_skill_roots:
+            root = Path(root_str).expanduser()
+            if not root.exists():
+                continue
+            for skill_dir in root.iterdir():
+                if not skill_dir.is_dir():
+                    continue
+                if not (skill_dir / "SKILL.md").exists():
+                    continue
+                skill_name = skill_dir.name
+                # Skip disabled skills and registry skills the sandbox does
+                # not get, so they get pruned from it
+                if skill_name in disabled or skill_name in outside_sandbox:
+                    continue
+                names.add(skill_name)
+        return names
+
+    return await asyncio.to_thread(build)
+
+
+async def _download_skills_lock(sandbox: "PTCSandbox") -> dict[str, Any] | None:
+    """Download and parse the existing skills-lock.json from sandbox.
+
+    Returns parsed skill entries dict, or None if missing/corrupt.
+    """
+    from ptc_agent.agent.middleware.skills.lock import LOCK_FILENAME, parse_skills_lock
+
+    lock_path = f"{sandbox.layout.skills}/{LOCK_FILENAME}"
+    assert sandbox.runtime is not None
+    try:
+        raw = await sandbox._runtime_call(
+            sandbox.runtime.download_file,
+            lock_path,
+            retry_policy=RetryPolicy.SAFE,
+        )
+        if raw:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            return parse_skills_lock(text)
+    except Exception:
+        logger.debug("No existing skills-lock.json (fresh sandbox or error)")
+    return None
+
+
+def _build_complete_skills_cache(
+    sandbox: "PTCSandbox",
+    skills_mod: dict[str, Any],
+    merged_lock: dict[str, Any],
+) -> None:
+    """Merge user-installed skills from lock file into the skills manifest cache.
+
+    This ensures known_skills in agent.py includes both platform and
+    user-installed skills, eliminating per-message downloads.
+    """
+    from ptc_agent.agent.middleware.skills.lock import lock_entry_to_skill_metadata
+
+    all_skills = dict(skills_mod.get("skills", {}))
+
+    skills_base = sandbox.layout.skills
+    lock_skills = merged_lock.get("skills", {})
+    for name, entry in lock_skills.items():
+        if entry.get("owner") == "user" and name not in all_skills:
+            skill_path = f"{skills_base}/{name}/SKILL.md"
+            meta = lock_entry_to_skill_metadata(entry, skill_path)
+            all_skills[name] = dict(meta)
+
+    sandbox._skills_manifest = {**skills_mod, "skills": all_skills}
+
+
+async def _prune_remote_skills(
+    sandbox: "PTCSandbox",
+    local_skill_names: set[str],
+    *,
+    existing_lock: dict[str, Any] | None = None,
+) -> None:
+    """Prune stale server-authoritative skills, protecting agent-installed ones.
+
+    Safe default: if lock is unavailable or a skill has no lock entry,
+    it is preserved to prevent data loss on transient failures.
+    """
+    from ptc_agent.agent.middleware.skills.lock import is_agent_installed, is_linked
+
+    if existing_lock is None:
+        # Every entry would be preserved below, so the listing buys nothing;
+        # on a new sandbox this is the usual case.
+        return
+    assert sandbox.runtime is not None
+    runtime = sandbox.runtime
+    skills_base = sandbox.layout.skills
+    entries = await sandbox.als_directory(skills_base)
+    if not entries:
+        return
+
+    paths_to_remove: list[str] = []
+    for entry in entries:
+        name = entry.get("name")
+        if not name:
+            continue
+        if not entry.get("is_dir", False):
+            continue
+        if name in local_skill_names:
+            continue  # Current platform skill — will be re-uploaded
+
+        # Unknown skill — check lock for ownership
+        lock_entry = existing_lock.get(name)
+        if lock_entry is None:
+            # Not in lock — unknown origin, preserve (safe default)
+            continue
+        if is_agent_installed(lock_entry):
+            # Agent-installed — no server-side source of truth, never prune
+            logger.debug("Preserving agent-installed skill", skill=name)
+            continue
+        if is_linked(lock_entry):
+            # Two-way synced workspace skill — the reconciler is its sole
+            # writer/pruner; a disabled linked row keeps its files on purpose.
+            logger.debug("Preserving linked workspace skill", skill=name)
+            continue
+        # Platform or server-managed skill no longer in local set — stale
+        # (deleted or disabled server-side), prune it
+        paths_to_remove.append(entry["path"])
+
+    if not paths_to_remove:
+        return
+
+    async def remove_one(path: str) -> None:
+        await sandbox._runtime_call(
+            runtime.exec,
+            f"rm -rf {shlex.quote(path)}",
+            retry_policy=RetryPolicy.SAFE,
+        )
+
+    await asyncio.gather(*[remove_one(path) for path in paths_to_remove])
+    logger.info(
+        "Pruned stale platform skills from sandbox",
+        removed=len(paths_to_remove),
+        sandbox_root=skills_base,
+    )
+
+
+async def _upload_skills(
+    sandbox: "PTCSandbox",
+    local_skills_dirs: list[str],
+    *,
+    manifest: dict[str, Any] | None = None,
+    existing_lock: dict[str, Any] | None = None,
+    disabled: frozenset[str] = frozenset(),
+) -> tuple[dict[str, Any] | None, set[str]]:
+    """Upload skill files from local filesystem to sandbox.
+
+    Uses a two-pass approach to fix override precedence:
+    - Pass 1 (local I/O only): Walk all sources, later sources overwrite earlier
+      ones for the same skill_name — each skill appears exactly once.
+    - Pass 2 (sandbox I/O): one archive unpacked into a staging dir, then one
+      exec that swaps each staged dir into place and merges the lock.
+
+    Args:
+        local_skills_dirs: Host directories, in precedence order. Every one
+            lands in the sandbox's skills folder.
+        manifest: Pre-computed skills manifest. If None, computed from local_skills_dirs.
+        existing_lock: Previously downloaded lock entries, or None for fresh sandbox.
+
+    Returns:
+        ``(merged_lock_or_None, collisions)`` — the merged lock file dict if
+        lock entries were written, plus the names skipped because
+        agent-installed or two-way-synced content occupies them (the caller
+        folds these into the module version so the skipped upload retries).
+    """
+    from ptc_agent.agent.middleware.skills import skills_outside_sandbox
+    from ptc_agent.agent.middleware.skills.lock import is_agent_installed, is_linked
+
+    disabled = _resolve_disabled_skills(disabled)
+
+    assert sandbox.runtime is not None
+    runtime = sandbox.runtime
+
+    if manifest is None:
+        manifest = await sandbox._compute_skills_module(
+            list(local_skills_dirs), disabled=disabled
+        )
+
+    if not manifest.get("files"):
+        logger.debug("No skills found; skipping upload")
+        return None, set()
+
+    outside_sandbox = skills_outside_sandbox()
+
+    # ── Pass 1: Planning (local I/O only) ──
+    # For each skill, collect files from the *last* source that provides it.
+    # Key: skill_name → list of (local_file, path relative to the skill dir)
+    @dataclass
+    class _SkillPlan:
+        files: list[tuple[Path, str]] = field(default_factory=list)
+        subdirs: set[str] = field(default_factory=set)
+
+    final_skills: dict[str, _SkillPlan] = {}
+
+    def _list_skill_dirs(local_root: Path) -> list[Path]:
+        dirs: list[Path] = []
+        for entry in local_root.iterdir():
+            if not entry.is_dir():
+                continue
+            if not (entry / "SKILL.md").exists():
+                continue
+            dirs.append(entry)
+        return dirs
+
+    def _list_skill_files(skill_dir: Path) -> list[Path]:
+        return [
+            p
+            for p in skill_dir.rglob("*")
+            if p.is_file() and "__pycache__" not in p.parts and p.name != "LICENSE.txt"
+        ]
+
+    def _plan_all() -> None:
+        for local_dir in local_skills_dirs:
+            local_path = Path(local_dir).expanduser()
+            if not local_path.exists():
+                continue
+
+            for skill_dir in _list_skill_dirs(local_path):
+                skill_name = skill_dir.name
+                if skill_name in ("", ".", ".."):
+                    continue
+                if skill_name in disabled or skill_name in outside_sandbox:
+                    continue
+
+                plan = _SkillPlan()
+
+                for fp in _list_skill_files(skill_dir):
+                    rel = fp.relative_to(skill_dir)
+                    plan.files.append((fp, rel.as_posix()))
+                    if len(rel.parts) > 1:
+                        plan.subdirs.add(rel.parent.as_posix())
+
+                # Later source overwrites earlier for same skill_name
+                final_skills[skill_name] = plan
+
+    await asyncio.to_thread(_plan_all)
+    # Every source lands in the one shared folder; planning above already
+    # collapsed a name to a single source on that assumption.
+    sandbox_base = sandbox.layout.skills
+
+    # Never write over content this path does not own: a planned skill whose
+    # name an agent-installed or reconciler-linked skill already occupies is
+    # skipped this cycle (the caller version-stamps the collision so it
+    # retries once the name frees up). Same predicate pair as the prune side.
+    if existing_lock:
+        collisions = {
+            name
+            for name in final_skills
+            if name in existing_lock
+            and (
+                is_agent_installed(existing_lock[name])
+                or is_linked(existing_lock[name])
+            )
+        }
+    else:
+        # No lock means either a fresh sandbox or a failed read, and the two
+        # are indistinguishable here. Ownership is unknowable, so every name
+        # already on disk is treated as owned by someone else. A fresh sandbox
+        # has no dirs and uploads everything; a failed read defers to the next
+        # pass rather than writing over an agent's files. Prune takes the same
+        # posture on the same signal.
+        #
+        # The trade is deliberate: a sandbox whose lock was deleted outright
+        # stops refreshing its platform skills until it is recreated, because
+        # every name it holds now reads as foreign. Stale skills that log a
+        # warning every pass beat silently overwriting an agent's own files on
+        # a transient download failure.
+        existing_dirs = {
+            e.get("name")
+            for e in (await sandbox.als_directory(sandbox_base) or [])
+            if e.get("is_dir")
+        }
+        collisions = {name for name in final_skills if name in existing_dirs}
+    if collisions:
+        for name in collisions:
+            del final_skills[name]
+        # One line, not one per name: an unreadable lock makes every skill on
+        # disk collide at once, and thirty identical warnings bury the flag
+        # that says which of the two branches produced them.
+        logger.warning(
+            "Skill upload skipped: the names are occupied by content this path "
+            "cannot prove it owns",
+            skills=sorted(collisions),
+            count=len(collisions),
+            lock_read=bool(existing_lock),
+        )
+
+    if not final_skills:
+        logger.debug("No skills to upload after planning")
+        return None, collisions
+
+    # Authoritative lock entries (platform + managed) from the manifest.
+    # Collision-skipped names stay OUT: their files are not written, so the
+    # lock must keep claiming the agent-installed entry, not the server one.
+    platform_entries = {}
+    for skill_name, skill_meta in manifest.get("skills", {}).items():
+        if skill_name in collisions:
+            continue
+        lock_entry = skill_meta.get("lock_entry")
+        if lock_entry:
+            platform_entries[skill_name] = lock_entry
+
+    # ── Pass 2: Execute (minimal sandbox I/O) ──
+    # Stage, then swap. A workspace link pass, on any worker, prunes every
+    # link the shared folder does not serve, so clearing a live dir before
+    # its upload would cost every workspace its link to that skill for the
+    # seconds the upload takes. The new bytes land in a hidden staging dir on
+    # the same filesystem and replace the live ones by rename. Every
+    # surviving name is either lock-verified as ours or absent from the
+    # sandbox, so the swap only ever displaces a dir this path is rewriting.
+
+    # Inline: skill_sync imports the skills lock module, whose package imports
+    # PTCSandbox, which imports this module.
+    from .skill_sync import install_staged_skills
+
+    staging = f"{sandbox_base}/.staging/sync-{token_hex(8)}"
+    try:
+        # 1. Every staged skill dir and file in one archive upload and one
+        # unpack: no race, since planning collapsed duplicates
+        staged_dirs: set[str] = set()
+        for name, plan in final_skills.items():
+            staged_dirs.add(f"{staging}/{name}")
+            staged_dirs.update(f"{staging}/{name}/{d}" for d in plan.subdirs)
+        await upload_tree(
+            sandbox,
+            [
+                (fp, f"{staging}/{name}/{rel}")
+                for name, plan in final_skills.items()
+                for fp, rel in plan.files
+            ],
+            dirs=sorted(staged_dirs),
+        )
+
+        # 2. One exec swaps every staged dir into place and merges the lock,
+        # both under the same .skills-sync.flock the reconciler holds for its
+        # passes. The merge is a fresh read-merge-write inside the sandbox: a
+        # host-side merge over `existing_lock` would be a snapshot taken
+        # before the multi-second prune/upload above, and writing it blind
+        # would silently drop anything the reconciler committed in between
+        # (whose next prune pass could then delete content the lock should
+        # have protected).
+        merged, lock_skipped = await install_staged_skills(
+            sandbox, staging, final_skills, platform_entries, base=sandbox_base
+        )
+    except Exception:
+        # The install removes its staging dir itself; this covers a failure
+        # before or during it. A leftover is swept once it is an hour old.
+        try:
+            await sandbox._runtime_call(
+                runtime.exec,
+                f"rm -rf {shlex.quote(staging)}",
+                retry_policy=RetryPolicy.SAFE,
+            )
+        except Exception:
+            logger.debug("Could not remove skill staging dir", staging=staging)
+        raise
+
+    if lock_skipped:
+        # Claimed agent/linked since the collision check: the claim keeps
+        # its bytes and its entry. Folded into the collisions so the caller's
+        # version stamp retries the name once the claim goes away.
+        logger.warning(
+            "Skill upload ceded to concurrent agent/linked claims",
+            skills=sorted(lock_skipped),
+        )
+        collisions = collisions | set(lock_skipped)
+
+    logger.debug(
+        "Uploaded skills to sandbox",
+        skill_count=len(final_skills),
+        file_count=len(manifest.get("files", {})),
+        platform_count=len(platform_entries),
+        user_count=sum(
+            1 for e in merged["skills"].values() if e.get("owner") == "user"
+        ),
+    )
+    return dict(merged), collisions

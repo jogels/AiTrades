@@ -1,0 +1,37 @@
+/*
+ * Page-intro modal visual panel: a close-up of the part of the page the step
+ * is about, framed by the scene's camera. It is drawn with the app's own
+ * tokens (page and card surfaces, borders, text, profit and loss colors), so
+ * a scene looks like the app in either theme rather than an illustration of
+ * it: solid surfaces, no tints, glows or decorative grid. The scenes' own
+ * classes load with them (introScenes/kit.css); this is the panel they play
+ * in, which the modal draws before any scene has loaded.
+ */
+
+.intro-visual {
+  position: relative;
+  overflow: hidden;
+  background: hsl(0 0% 7%);
+  color: var(--color-text-primary);
+}
+
+/* The app's page ground, as the windows drawn on it have: the canvas is
+   kept for the ground under filled cards (orders). */
+[data-theme='light'] .intro-visual {
+  background: var(--color-bg-page);
+}
+
+/* Radix's built-in close button sits over the visual panel — follow the
+   panel's theme rather than the default dialog foreground. */
+.intro-dialog > button {
+  color: rgba(255, 255, 255, 0.7);
+}
+.intro-dialog > button:hover {
+  color: #fff;
+}
+[data-theme='light'] .intro-dialog > button {
+  color: rgba(18, 22, 30, 0.55);
+}
+[data-theme='light'] .intro-dialog > button:hover {
+  color: rgba(18, 22, 30, 0.85);
+}

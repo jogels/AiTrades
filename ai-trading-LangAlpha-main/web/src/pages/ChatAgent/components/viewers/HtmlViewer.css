@@ -1,0 +1,27 @@
+.html-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Iframe preview */
+.html-viewer-frame {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: none;
+  /* Shows through transparent-bodied documents (widgets mandate a transparent
+     shell) and before the document paints — must follow the app theme, not
+     hardcode white against a dark surface. */
+  background: var(--color-bg-page);
+}
+
+/* Source view — wraps the shared SyntaxHighlighter */
+.html-viewer-source {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  tab-size: 2;
+}

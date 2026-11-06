@@ -1,0 +1,562 @@
+"""Pydantic models for User, UserPreferences, Watchlist, and Portfolio."""
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated, Any, Dict, List, Literal, Optional
+from uuid import UUID
+
+from market_protocol import display_spelling
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, field_validator
+
+from src.server.models.profile_vocabulary import STRUCTURED_PREFERENCES
+
+
+# =============================================================================
+# Symbol Normalization
+# =============================================================================
+
+
+def normalize_symbol(symbol: str) -> str:
+    """The one spelling a row stores, so ``600519.SS`` and ``600519.SH`` are
+    one listing."""
+    return display_spelling(symbol)
+
+
+def _stored_symbol(v: Any) -> Any:
+    # A non-string is left for Pydantic to reject as one.
+    return normalize_symbol(v) if isinstance(v, str) else v
+
+
+StoredSymbol = Annotated[str, BeforeValidator(_stored_symbol)]
+
+
+# =============================================================================
+# Instrument Types
+# =============================================================================
+
+
+KNOWN_INSTRUMENT_TYPES: frozenset[str] = frozenset(
+    {"stock", "etf", "index", "crypto", "future", "commodity", "currency"}
+)
+"""Canonical instrument types. Extra values are accepted (the agent may classify
+holdings outside this set, e.g. 'cash_management') so the column is treated as
+an open vocabulary; this set documents the conventional values."""
+
+
+def normalize_instrument_type(v: Any) -> Any:
+    if isinstance(v, str):
+        return v.strip().lower()
+    return v
+
+
+# =============================================================================
+# JSONB Schema Models (for validation)
+# =============================================================================
+
+
+def _doc(column: str, key: str) -> str:
+    """A structured key's description, the one its vocabulary carries."""
+    return STRUCTURED_PREFERENCES[column][key].doc
+
+
+class RiskPreference(BaseModel):
+    """Risk preference settings stored in JSONB."""
+
+    model_config = ConfigDict(extra="allow")
+
+    # The structured keys are Any and checked in the endpoint instead
+    # (``check_profile`` in ``profile_vocabulary``). Every response model
+    # parses the stored row, so a type here would fail the read of a value
+    # saved before the key had one; and a vocabulary refusal and a type
+    # refusal then share one 422 shape.
+    risk_level: Optional[Any] = Field(None, description=_doc("risk_preference", "risk_level"))
+    risk_tolerance: Optional[str] = Field(
+        None, description="Free-text risk tolerance, from before risk_level"
+    )
+
+
+class InvestmentPreference(BaseModel):
+    """Investment preference settings stored in JSONB."""
+
+    model_config = ConfigDict(extra="allow")
+
+    investor_type: Optional[Any] = Field(
+        None, description=_doc("investment_preference", "investor_type")
+    )
+    experience: Optional[Any] = Field(None, description=_doc("investment_preference", "experience"))
+    help_with: Optional[Any] = Field(None, description=_doc("investment_preference", "help_with"))
+    familiar_instruments: Optional[Any] = Field(
+        None, description=_doc("investment_preference", "familiar_instruments")
+    )
+    markets: Optional[Any] = Field(None, description=_doc("investment_preference", "markets"))
+    asset_classes: Optional[Any] = Field(
+        None, description=_doc("investment_preference", "asset_classes")
+    )
+    approaches: Optional[Any] = Field(None, description=_doc("investment_preference", "approaches"))
+    styles: Optional[Any] = Field(None, description=_doc("investment_preference", "styles"))
+    horizon: Optional[Any] = Field(None, description=_doc("investment_preference", "horizon"))
+    sectors: Optional[Any] = Field(None, description=_doc("investment_preference", "sectors"))
+    brokerages: Optional[Any] = Field(None, description=_doc("investment_preference", "brokerages"))
+    company_interest: Optional[str] = Field(
+        None, description="Type of companies interested in"
+    )
+    holding_period: Optional[str] = Field(
+        None, description="Free-text holding period, from before horizon"
+    )
+    analysis_focus: Optional[str] = Field(
+        None, description="Primary analysis focus area"
+    )
+
+
+class AgentPreference(BaseModel):
+    """AI agent behavior preferences stored in JSONB."""
+
+    model_config = ConfigDict(extra="allow")
+
+    # Any, and checked in the endpoint, for the reasons RiskPreference gives.
+    # A null survives the parse too, which the JSONB merge reads as deleting
+    # the key: Settings sends one to go back to letting the agent decide.
+    research_depth: Optional[Any] = Field(None, description=_doc("agent_preference", "research_depth"))
+    proactivity: Optional[Any] = Field(None, description=_doc("agent_preference", "proactivity"))
+    output_style: Optional[str] = Field(
+        None, description="Preferred output style"
+    )
+    output_format: Optional[Any] = Field(None, description=_doc("agent_preference", "output_format"))
+
+
+class OtherPreference(BaseModel):
+    """Miscellaneous preferences stored in JSONB."""
+
+    model_config = ConfigDict(extra="allow")
+
+    # Strict: a setting that skips approval cards is refused unless it is a
+    # real boolean, rather than guessed from "yes" or 1.
+    auto_approve_handoffs: Optional[StrictBool] = Field(
+        None, description="Hand work to an analyst without asking; absent means ask."
+    )
+    auto_approve_workspace_creation: Optional[StrictBool] = Field(
+        None, description="Create workspaces without asking; absent means ask."
+    )
+
+
+class ModelPreference(BaseModel):
+    """Model configuration stored in JSONB: catalog, routing, and tuning.
+
+    Open like its sibling because the key set is owned by the resolver, not by
+    this schema. ``profiles`` is the one key with structure the DB layer knows
+    about — it merges per model name rather than wholesale.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+
+class AlertSettings(BaseModel):
+    """Alert settings for watchlist items."""
+
+    model_config = ConfigDict(extra="allow")
+
+    price_above: Optional[float] = Field(None, description="Alert when price goes above")
+    price_below: Optional[float] = Field(None, description="Alert when price goes below")
+    percent_change: Optional[float] = Field(
+        None, description="Alert on percent change threshold"
+    )
+    news_alerts: Optional[bool] = Field(None, description="Enable news alerts")
+
+
+# =============================================================================
+# User Models
+# =============================================================================
+
+
+class UserBase(BaseModel):
+    """Base user fields."""
+
+    email: Optional[str] = Field(None, max_length=255, description="User email")
+    name: Optional[str] = Field(None, max_length=255, description="User display name")
+    avatar_url: Optional[str] = Field(None, description="URL to user avatar")
+    timezone: Optional[str] = Field(
+        None, max_length=100, description="User timezone (e.g., 'America/New_York')"
+    )
+    locale: Optional[str] = Field(
+        None, max_length=20, description="User locale (e.g., 'en-US')"
+    )
+
+
+class UserCreate(UserBase):
+    """Request model for creating a new user."""
+
+    user_id: str = Field(
+        ..., max_length=255, description="External auth ID (e.g., Clerk, Auth0)"
+    )
+
+
+class UserUpdate(UserBase):
+    """Request model for updating user profile."""
+
+    onboarding_completed: Optional[bool] = Field(
+        None, description="Whether onboarding is completed"
+    )
+    personalization_completed: Optional[bool] = Field(
+        None, description="Whether personalization wizard is completed"
+    )
+
+
+class UserResponse(UserBase):
+    """Response model for user details."""
+
+    user_id: str = Field(description="User ID")
+    onboarding_completed: bool = Field(
+        default=False, description="Whether onboarding is completed"
+    )
+    personalization_completed: bool = Field(
+        default=False, description="Whether personalization wizard is completed"
+    )
+    has_api_key: bool = Field(
+        default=False, description="Whether user has at least one API key configured"
+    )
+    has_oauth_token: bool = Field(
+        default=False, description="Whether user has at least one OAuth token connected"
+    )
+    access_tier: int = Field(
+        default=-1, description="Platform access tier. -1 = no access, 0+ = tier level."
+    )
+    deployment_serves: bool = Field(
+        default=False,
+        description="Whether the deployment's own key runs its default model, so the user needs no provider of their own",
+    )
+    plan_display_name: Optional[str] = Field(
+        default=None,
+        description="Display name of the user's active plan (e.g. 'Pro'). None when no subscription.",
+    )
+    auth_provider: Optional[str] = Field(
+        None, description="Authentication provider (e.g. google, github, email)"
+    )
+    created_at: datetime = Field(description="Creation timestamp")
+    updated_at: datetime = Field(description="Last update timestamp")
+    last_login_at: Optional[datetime] = Field(None, description="Last login timestamp")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# =============================================================================
+# User Preferences Models
+# =============================================================================
+
+
+class UserPreferencesBase(BaseModel):
+    """Base preferences fields."""
+
+    # ``model_preference`` collides with Pydantic's reserved ``model_`` prefix;
+    # the column name predates the schema and is the one users see in the API.
+    model_config = ConfigDict(protected_namespaces=())
+
+    risk_preference: Optional[RiskPreference] = Field(
+        default_factory=RiskPreference, description="Risk tolerance settings"
+    )
+    investment_preference: Optional[InvestmentPreference] = Field(
+        default_factory=InvestmentPreference, description="Investment style settings"
+    )
+    agent_preference: Optional[AgentPreference] = Field(
+        default_factory=AgentPreference, description="AI agent behavior settings"
+    )
+    other_preference: Optional[OtherPreference] = Field(
+        default_factory=OtherPreference, description="Miscellaneous preferences"
+    )
+    model_preference: Optional[ModelPreference] = Field(
+        default_factory=ModelPreference, description="Model catalog, routing and tuning settings"
+    )
+
+
+class UserPreferencesCreate(UserPreferencesBase):
+    """Request model for creating user preferences."""
+
+    pass
+
+
+class UserPreferencesUpdate(UserPreferencesBase):
+    """Request model for updating user preferences."""
+
+    apply_default_to: Optional[Literal["new_threads", "existing_threads"]] = Field(
+        None,
+        description="This write's answer to what a changed default model does "
+        "to existing threads: 'existing_threads' moves the threads still on the "
+        "old default to the new one, 'new_threads' leaves them. Never stored; "
+        "absent, model_preference.default_model_scope decides.",
+    )
+
+
+class UserPreferencesResponse(UserPreferencesBase):
+    """Response model for user preferences."""
+
+    user_preference_id: UUID = Field(description="Preference record ID")
+    user_id: str = Field(description="User ID")
+    created_at: datetime = Field(description="Creation timestamp")
+    updated_at: datetime = Field(description="Last update timestamp")
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("model_preference", mode="before")
+    @classmethod
+    def _spell_borrowed_ladders(cls, value):
+        # Every read of the column reaches the web through here.
+        from src.server.services.llm.user_models import with_borrowed_ladders
+
+        return with_borrowed_ladders(value) if isinstance(value, dict) else value
+
+
+class UserPreferencesUpdateResponse(UserPreferencesResponse):
+    """Response model for a preferences write."""
+
+    threads_reassigned: int = Field(
+        0,
+        description="Threads this write moved from the old default model to "
+        "the new one (see apply_default_to).",
+    )
+
+
+# =============================================================================
+# Watchlist Models
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Watchlist (list metadata) Models
+# -----------------------------------------------------------------------------
+
+
+class WatchlistBase(BaseModel):
+    """Base watchlist fields."""
+
+    name: str = Field(..., max_length=100, description="Watchlist name")
+    description: Optional[str] = Field(None, description="Watchlist description")
+    is_default: bool = Field(default=False, description="Whether this is the default watchlist")
+    display_order: int = Field(default=0, description="Display order for sorting")
+
+
+class WatchlistCreate(WatchlistBase):
+    """Request model for creating a watchlist."""
+
+    pass
+
+
+class WatchlistUpdate(BaseModel):
+    """Request model for updating watchlist metadata."""
+
+    name: Optional[str] = Field(None, max_length=100, description="Watchlist name")
+    description: Optional[str] = Field(None, description="Watchlist description")
+    display_order: Optional[int] = Field(None, description="Display order for sorting")
+
+
+class WatchlistResponse(WatchlistBase):
+    """Response model for watchlist metadata."""
+
+    watchlist_id: UUID = Field(description="Watchlist ID")
+    user_id: str = Field(description="User ID")
+    created_at: datetime = Field(description="Creation timestamp")
+    updated_at: datetime = Field(description="Last update timestamp")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -----------------------------------------------------------------------------
+# Watchlist Item Models
+# -----------------------------------------------------------------------------
+
+
+class WatchlistItemBase(BaseModel):
+    """Base watchlist item fields."""
+
+    symbol: StoredSymbol = Field(..., max_length=50, description="Instrument symbol")
+    instrument_type: str = Field(
+        ...,
+        min_length=1,
+        max_length=30,
+        description=(
+            "Type of instrument. Common values: stock, etf, index, crypto, future, "
+            "commodity, currency. Other values are accepted."
+        ),
+    )
+    exchange: Optional[str] = Field(
+        None, max_length=50, description="Exchange (e.g., 'NASDAQ')"
+    )
+    name: Optional[str] = Field(None, max_length=255, description="Full instrument name")
+    notes: Optional[str] = Field(None, description="User notes")
+    alert_settings: Optional[AlertSettings] = Field(
+        default_factory=AlertSettings, description="Price alert settings"
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default_factory=dict, description="Additional metadata"
+    )
+
+    @field_validator("instrument_type", mode="before")
+    @classmethod
+    def normalize_instrument_type_field(cls, v: Any) -> Any:
+        return normalize_instrument_type(v)
+
+
+class WatchlistItemCreate(WatchlistItemBase):
+    """Request model for adding item to watchlist."""
+
+    pass
+
+
+class WatchlistItemUpdate(BaseModel):
+    """Request model for updating watchlist item."""
+
+    name: Optional[str] = Field(None, max_length=255, description="Full instrument name")
+    notes: Optional[str] = Field(None, description="User notes")
+    alert_settings: Optional[AlertSettings] = Field(
+        None, description="Price alert settings"
+    )
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
+
+
+class WatchlistItemResponse(WatchlistItemBase):
+    """Response model for watchlist item."""
+
+    watchlist_item_id: UUID = Field(description="Watchlist item ID")
+    watchlist_id: UUID = Field(description="Parent watchlist ID")
+    user_id: str = Field(description="User ID")
+    created_at: datetime = Field(description="Creation timestamp")
+    updated_at: datetime = Field(description="Last update timestamp")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -----------------------------------------------------------------------------
+# Aggregated Response Models
+# -----------------------------------------------------------------------------
+
+
+class WatchlistItemsResponse(BaseModel):
+    """Response model for watchlist items list (backward compatibility)."""
+
+    items: List[WatchlistItemResponse] = Field(
+        default_factory=list, description="Watchlist items"
+    )
+    total: int = Field(0, description="Total number of items")
+
+
+class WatchlistWithItemsResponse(WatchlistResponse):
+    """Response model for watchlist with its items."""
+
+    items: List[WatchlistItemResponse] = Field(
+        default_factory=list, description="Watchlist items"
+    )
+    total: int = Field(0, description="Total number of items")
+
+
+class WatchlistsResponse(BaseModel):
+    """Response model for list of watchlists."""
+
+    watchlists: List[WatchlistResponse] = Field(
+        default_factory=list, description="User's watchlists"
+    )
+    total: int = Field(0, description="Total number of watchlists")
+
+
+# =============================================================================
+# Portfolio Models
+# =============================================================================
+
+
+class PortfolioHoldingBase(BaseModel):
+    """Base portfolio holding fields."""
+
+    symbol: StoredSymbol = Field(..., max_length=50, description="Instrument symbol")
+    instrument_type: str = Field(
+        ...,
+        min_length=1,
+        max_length=30,
+        description=(
+            "Type of instrument. Common values: stock, etf, index, crypto, future, "
+            "commodity, currency. Other values are accepted."
+        ),
+    )
+    exchange: Optional[str] = Field(
+        None, max_length=50, description="Exchange (e.g., 'NASDAQ')"
+    )
+    name: Optional[str] = Field(None, max_length=255, description="Full instrument name")
+    quantity: Decimal = Field(..., description="Number of units held")
+    average_cost: Optional[Decimal] = Field(None, description="Average cost per unit")
+    currency: str = Field(default="USD", max_length=10, description="Currency")
+    account_name: Optional[str] = Field(
+        None, max_length=100, description="Account name (e.g., 'Robinhood')"
+    )
+    notes: Optional[str] = Field(None, description="User notes")
+    metadata: Optional[Dict[str, Any]] = Field(
+        default_factory=dict, description="Additional metadata"
+    )
+    first_purchased_at: Optional[datetime] = Field(
+        None, description="First purchase date"
+    )
+
+    @field_validator("instrument_type", mode="before")
+    @classmethod
+    def normalize_instrument_type_field(cls, v: Any) -> Any:
+        return normalize_instrument_type(v)
+
+
+class PortfolioHoldingCreate(PortfolioHoldingBase):
+    """Request model for adding holding to portfolio."""
+
+    currency: Optional[str] = Field(
+        None,
+        max_length=10,
+        description=(
+            "Currency of average_cost. Omitted, a new holding takes its listing's "
+            "quote currency (CNY for 600519.SH) and a merge keeps the existing "
+            "holding's. A currency other than the existing holding's is refused with 409."
+        ),
+    )
+
+
+class PortfolioHoldingUpdate(BaseModel):
+    """Request model for updating portfolio holding."""
+
+    name: Optional[str] = Field(None, max_length=255, description="Full instrument name")
+    quantity: Optional[Decimal] = Field(None, description="Number of units held")
+    average_cost: Optional[Decimal] = Field(None, description="Average cost per unit")
+    currency: Optional[str] = Field(None, max_length=10, description="Currency")
+    account_name: Optional[str] = Field(
+        None, max_length=100, description="Account name (e.g., 'Robinhood')"
+    )
+    notes: Optional[str] = Field(None, description="User notes")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
+    first_purchased_at: Optional[datetime] = Field(
+        None, description="First purchase date"
+    )
+
+
+class PortfolioHoldingResponse(PortfolioHoldingBase):
+    """Response model for portfolio holding."""
+
+    user_portfolio_id: UUID = Field(description="Holding entry ID")
+    user_id: str = Field(description="User ID")
+    created_at: datetime = Field(description="Creation timestamp")
+    updated_at: datetime = Field(description="Last update timestamp")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PortfolioResponse(BaseModel):
+    """Response model for user's full portfolio."""
+
+    holdings: List[PortfolioHoldingResponse] = Field(
+        default_factory=list, description="Portfolio holdings"
+    )
+    total: int = Field(0, description="Total number of holdings")
+
+
+# =============================================================================
+# Combined Response Models (for /me endpoint)
+# =============================================================================
+
+
+class UserWithPreferencesResponse(BaseModel):
+    """Combined response for GET /users/me endpoint."""
+
+    user: UserResponse = Field(description="User profile")
+    preferences: Optional[UserPreferencesResponse] = Field(
+        None, description="User preferences (may be null if not set)"
+    )

@@ -1,0 +1,1033 @@
+"""Middleware for providing subagents to an agent via a `Task` tool."""
+
+import time
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from typing import Annotated, Any, NotRequired, TypedDict, cast
+
+import structlog
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    ModelRequest,
+    ModelResponse,
+)
+from langchain.tools import BaseTool, ToolRuntime
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.runnables import Runnable
+from langchain_core.runnables.config import var_child_runnable_config
+from langchain_core.tools import StructuredTool
+from langgraph.config import get_config
+from langgraph.errors import GraphInterrupt
+from langgraph.types import Command
+
+from ptc_agent.agent.middleware.background_subagent.context import (
+    steer_resume_for,
+    steer_resume_held,
+)
+from ptc_agent.agent.middleware.background_subagent.middleware import (
+    current_background_token_tracker,
+    current_background_tool_call_id,
+)
+from ptc_agent.agent.middleware.background_subagent.outcomes import (
+    SubagentTimeLimitError,
+)
+from ptc_agent.agent.middleware.background_subagent.registry import (
+    BackgroundTaskRegistry,
+    TransportLostError,
+)
+from ptc_agent.agent.middleware.background_subagent.token_forwarder import (
+    _SubagentTokenForwarder,
+)
+from ptc_agent.agent.middleware._utils import append_to_system_message
+from ptc_agent.agent.middleware.runtime_context.turn import (
+    TURN_DEADLINE_KEY,
+    TURN_TIME_LIMIT_KEY,
+)
+from ptc_agent.agent.state import DeltaAgentState
+from src.llms.llm import narrow_prompt_cache_key
+from src.observability.langsmith_tracer import with_run_tracer
+from src.utils.concurrency import aclose_within
+from src.utils.stream_coalescing import HEARTBEAT_EVENT_TYPE
+
+logger = structlog.get_logger(__name__)
+
+# How long past its clock a run may go before it is stopped. The ask for its
+# answer and the tool stop come well before the end, so this only lets an
+# answer already being written land.
+SUBAGENT_STOP_GRACE_S = 60.0
+
+# How long a stopped run waits on its graph's cleanup, as the turn's own stop
+# does: LangGraph awaits its cancelled node tasks with no bound.
+SUBAGENT_CLOSE_TIMEOUT_S = 30.0
+
+# The launching run's resume and replay flags, which LangGraph hands every task
+# of that run. A subagent takes both from its own input: inherited from a turn
+# that answered an interrupt, ``__pregel_resuming`` skips the prompt of a
+# follow-up to a task that already has state, and from a retried turn,
+# ``__pregel_replay_state`` loads the task's state from before the retry point.
+PARENT_RUN_STATE_KEYS = frozenset({"__pregel_resuming", "__pregel_replay_state"})
+
+
+
+
+class SubAgent(TypedDict):
+    """Specification for an agent.
+
+    When specifying custom agents, the `default_middleware` from `SubAgentMiddleware`
+    will be applied first, followed by any `middleware` specified in this spec.
+    To use only custom middleware without the defaults, pass `default_middleware=[]`
+    to `SubAgentMiddleware`.
+
+    Required fields:
+        name: Unique identifier for the subagent.
+
+            The main agent uses this name when calling the `Task()` tool.
+        description: What this subagent does.
+
+            Be specific and action-oriented. The main agent uses this to decide when to delegate.
+        system_prompt: Instructions for the subagent.
+
+            Include tool usage guidance and output format requirements.
+        tools: Tools the subagent can use.
+
+            Keep this minimal and include only what's needed.
+
+    Optional fields:
+        model: Override the main agent's model.
+
+            Use the format `'provider:model-name'` (e.g., `'openai:gpt-4o'`).
+        middleware: Additional middleware for custom behavior, logging, or rate limiting.
+        interrupt_on: Configure human-in-the-loop for specific tools.
+
+            Requires a checkpointer.
+    """
+
+    name: str
+    """Unique identifier for the subagent."""
+
+    description: str
+    """What this subagent does. The main agent uses this to decide when to delegate."""
+
+    system_prompt: str
+    """Instructions for the subagent."""
+
+    tools: Sequence[BaseTool | Callable | dict[str, Any]]
+    """Tools the subagent can use."""
+
+    model: NotRequired[str | BaseChatModel]
+    """Override the main agent's model. Use `'provider:model-name'` format."""
+
+    middleware: NotRequired[list[AgentMiddleware]]
+    """Additional middleware for custom behavior."""
+
+    interrupt_on: NotRequired[dict[str, bool | InterruptOnConfig]]
+    """Configure human-in-the-loop for specific tools."""
+
+
+class CompiledSubAgent(TypedDict):
+    """A pre-compiled agent spec.
+
+    !!! note
+
+        The runnable's state schema must include a 'messages' key.
+
+        This is required for the subagent to communicate results back to the main agent.
+
+    When the subagent completes, the final message in the 'messages' list will be
+    extracted and returned as a `ToolMessage` to the parent agent.
+    """
+
+    name: str
+    """Unique identifier for the subagent."""
+
+    description: str
+    """What this subagent does."""
+
+    runnable: Runnable
+    """A custom agent implementation.
+
+    Create a custom agent using either:
+
+    1. LangChain's [`create_agent()`](https://docs.langchain.com/oss/python/langchain/quickstart)
+    2. A custom graph using [`langgraph`](https://docs.langchain.com/oss/python/langgraph/quickstart)
+
+    If you're creating a custom graph, make sure the state schema includes a 'messages' key.
+    This is required for the subagent to communicate results back to the main agent.
+    """
+
+
+DEFAULT_SUBAGENT_PROMPT = "In order to complete the objective that the user asks of you, you have access to a number of standard tools."
+
+# State keys that are excluded when passing state to subagents and when returning
+# updates from subagents.
+# When returning updates:
+# 1. The messages key is handled explicitly to ensure only the final message is included
+# 2. The todos and structured_response keys are excluded as they do not have a defined reducer
+#    and no clear meaning for returning them from a subagent to the main agent.
+_EXCLUDED_STATE_KEYS = {"messages", "todos", "structured_response"}
+
+TASK_TOOL_DESCRIPTION = """Launch a subagent for complex, multi-step tasks.
+
+Use for: Complex tasks, isolated research, context-heavy operations.
+NOT for: Simple 1-2 tool operations (do directly).
+
+Args:
+    description: Short 1-2 sentence title shown on the task card. Think commit subject line.
+    prompt: The subagent's complete instructions. It sees nothing of this conversation, so include all the context, data and expected output format it needs.
+    subagent_type: Which subagent to use (e.g. "general-purpose"). Required for "init".
+    action: "init" (new task, default), "update" (instruct a running task), "resume" (continue a completed or stopped task from its checkpoint, with its prior context intact)
+    task_id: The target task's short alphanumeric ID. Required for "update" and "resume".
+
+Returns:
+    A task ID immediately, not the subagent's work. The subagent runs
+    autonomously and reports only its final result; intermediate steps stay
+    hidden.
+
+You are notified when the task finishes. TaskOutput then returns its
+result."""
+
+
+def _get_subagents(
+    *,
+    default_model: str | BaseChatModel,
+    default_tools: Sequence[BaseTool | Callable | dict[str, Any]],
+    default_middleware: list[AgentMiddleware] | None,
+    default_interrupt_on: dict[str, bool | InterruptOnConfig] | None,
+    subagents: list[SubAgent | CompiledSubAgent],
+    general_purpose_agent: bool,
+    checkpointer: Any | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Build compiled subagent instances from specs.
+
+    Returns ``(agent_dict, description_list)`` where ``agent_dict`` maps
+    agent names to runnable instances.
+    """
+    # Use empty list if None (no default middleware)
+    default_subagent_middleware = default_middleware or []
+
+    agents: dict[str, Any] = {}
+    subagent_descriptions = []
+
+    # Create general-purpose agent if enabled
+    if general_purpose_agent:
+        general_purpose_middleware = [*default_subagent_middleware]
+        if default_interrupt_on:
+            general_purpose_middleware.append(
+                HumanInTheLoopMiddleware(interrupt_on=default_interrupt_on)
+            )
+        general_purpose_subagent = create_agent(
+            narrow_prompt_cache_key(default_model, "general-purpose"),
+            system_prompt=DEFAULT_SUBAGENT_PROMPT,
+            tools=default_tools,
+            middleware=general_purpose_middleware,
+            name="general-purpose",
+            checkpointer=checkpointer,
+            state_schema=DeltaAgentState,
+        )
+        agents["general-purpose"] = general_purpose_subagent
+        subagent_descriptions.append(
+            "- general-purpose: General-purpose agent with access to all tools."
+        )
+
+    # Process custom subagents
+    for agent_ in subagents:
+        subagent_descriptions.append(f"- {agent_['name']}: {agent_['description']}")
+        if "runnable" in agent_:
+            custom_agent = cast("CompiledSubAgent", agent_)
+            agents[custom_agent["name"]] = custom_agent["runnable"]
+            continue
+        _tools = agent_.get("tools", list(default_tools))
+
+        subagent_model = agent_.get("model", default_model)
+
+        _middleware = (
+            [*default_subagent_middleware, *agent_["middleware"]]
+            if "middleware" in agent_
+            else [*default_subagent_middleware]
+        )
+
+        interrupt_on = agent_.get("interrupt_on", default_interrupt_on)
+        if interrupt_on:
+            _middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+
+        agents[agent_["name"]] = create_agent(
+            narrow_prompt_cache_key(subagent_model, agent_["name"]),
+            system_prompt=agent_["system_prompt"],
+            tools=_tools,
+            middleware=_middleware,
+            name=agent_["name"],
+            checkpointer=checkpointer,
+            state_schema=DeltaAgentState,
+        )
+    return agents, subagent_descriptions
+
+
+def _without_stream_tee(config: dict) -> dict:
+    return {
+        **config,
+        "configurable": {
+            k: v
+            for k, v in (config.get("configurable") or {}).items()
+            if k != "__pregel_stream"
+        },
+    }
+
+
+def _with_own_deadline(config: dict, limit: float | None = None) -> dict:
+    """Give the run its own wall clock in place of the launcher's.
+
+    A subagent outlives the turn that started it, so the turn's deadline does
+    not bound it, and with no step cap nothing else did. It gets the turn's
+    length from its own start, read the same way, and the same wrap-up before
+    the end: one row asking for its answer, then its tools stop. ``limit``
+    shortens it for a run something else kills sooner (a workflow child), so
+    the wrap-up comes before that kill rather than after it.
+    """
+    from src.config.settings import get_workflow_timeout
+
+    configurable = dict(config.get("configurable") or {})
+    configurable.pop(TURN_DEADLINE_KEY, None)
+    configurable.pop(TURN_TIME_LIMIT_KEY, None)
+    bounds = [
+        bound
+        for bound in (get_workflow_timeout(), limit)
+        if bound is not None and bound > 0
+    ]
+    if bounds:
+        clock = min(bounds)
+        configurable[TURN_DEADLINE_KEY] = time.time() + clock
+        configurable[TURN_TIME_LIMIT_KEY] = clock
+    return {**config, "configurable": configurable}
+
+
+@contextmanager
+def _detached_from_launcher() -> Iterator[None]:
+    """Run the enclosed subagent as its own run, not a child of its launcher.
+
+    LangGraph merges the ambient config's callbacks into an explicit
+    ``callbacks`` list, so the launcher's token tracker would bill every
+    subagent call a second time and its StreamMessagesHandler would keep every
+    token in a queue nobody drains once that turn ends. ``ensure_config`` reads
+    ``callbacks: None`` as absent, and the rest of the ambient config, launcher
+    metadata such as ``run_id`` included, still merges beneath the run's own.
+    """
+    ambient = var_child_runnable_config.get()
+    if not ambient:
+        yield
+        return
+    token = var_child_runnable_config.set(
+        {**_without_stream_tee(ambient), "callbacks": None}
+    )
+    try:
+        yield
+    finally:
+        var_child_runnable_config.reset(token)
+
+
+async def arun_subagent_streaming(
+    subagent: Runnable,
+    state: dict,
+    config: dict,
+    *,
+    registry: BackgroundTaskRegistry | None,
+    tool_call_id: str | None = None,
+    time_limit: float | None = None,
+) -> dict:
+    """Drive the subagent through ``astream`` with combined ``values``,
+    ``messages``, and ``custom`` modes; return the final state.
+
+    ``values`` mode yields full state snapshots; the last one is the
+    tool's return value. ``messages`` mode yields per-token
+    ``AIMessageChunk`` deltas forwarded to the registry as
+    ``message_chunk`` records for per-task SSE granularity. ``custom``
+    mode surfaces ``get_stream_writer()`` events emitted from inside the
+    subagent (e.g. compaction's ``context_window`` token_usage / summarize
+    / offload signals) which would otherwise die at the astream boundary.
+
+    ``tool_call_id`` identifies the BackgroundTask for event forwarding;
+    when omitted it falls back to the ContextVar set by the Task-tool
+    interception path. ``time_limit`` caps the run's own clock.
+    """
+    last_state: dict | None = None
+    forwarder: _SubagentTokenForwarder | None = None
+    bg_task = None
+
+    if registry is not None:
+        tool_call_id = tool_call_id or current_background_tool_call_id.get()
+        if tool_call_id:
+            bg_task = registry.get_by_tool_call_id(tool_call_id)
+            if bg_task is not None:
+                forwarder = _SubagentTokenForwarder(
+                    registry,
+                    tool_call_id,
+                    f"task:{bg_task.task_id}",
+                )
+
+    # A ``__pregel_stream`` copied from the launcher tees this run's graph
+    # updates into the launcher's stream, which nobody drains once that turn
+    # ends. Either configurable can reach the run: the explicit one when it
+    # carries checkpoint coordinates (``ensure_config`` then discards the
+    # ambient one), the ambient one when it does not, so each is stripped.
+    config = _without_stream_tee(config)
+    config = _with_own_deadline(config, time_limit)
+    # Built here, under the launcher's run, so the subagent's trace nests
+    # where langchain_core's own tracer would put it, without that tracer
+    # holding the subagent's whole tree until it ends.
+    config = with_run_tracer(config)
+    # The clock's own end, checked on every event: a model call beats about
+    # ten times a second, so a run is stopped within the grace of it unless a
+    # tool runs silent past it, which that tool's own timeout bounds. Checked
+    # here rather than under an ``asyncio.timeout``, whose cancel could land in
+    # this loop's own spill and tear the task's event stream.
+    configurable = config.get("configurable") or {}
+    deadline = configurable.get(TURN_DEADLINE_KEY)
+    stop_at = (
+        deadline + SUBAGENT_STOP_GRACE_S
+        if isinstance(deadline, int | float)
+        else None
+    )
+    try:
+        with _detached_from_launcher():
+            # Sync, as the main graph runs: a model call confirms the steers
+            # the step before it injected, so that step must be saved first.
+            stream = subagent.astream(
+                state,
+                config,
+                stream_mode=["values", "messages", "custom"],
+                durability="sync",
+            )
+            try:
+                async for mode, data in stream:
+                    if stop_at is not None and time.time() >= stop_at:
+                        raise SubagentTimeLimitError(
+                            f"Timed out after "
+                            f"{int(configurable.get(TURN_TIME_LIMIT_KEY) or 0)}s"
+                        )
+                    # Root symmetry (retention contract): once the spill circuit
+                    # opens, every further frame widens the hole in the replay
+                    # archive — abort the graph instead of completing a run
+                    # whose stream is torn.
+                    if bg_task is not None and bg_task.redis_write_failed:
+                        raise TransportLostError(
+                            "transport_lost: subagent event spill failed; "
+                            "aborting so the run finalizes instead of "
+                            "completing with a torn stream"
+                        )
+                    if bg_task is not None:
+                        try:
+                            await registry.flush_held_delta(bg_task, due_only=True)
+                        except Exception as exc:
+                            logger.debug("Subagent delta flush failed", error=str(exc))
+                    # A beat wakes the flush above and tells the orphan
+                    # collector the model call it beats for is still running.
+                    if (
+                        mode == "custom"
+                        and isinstance(data, dict)
+                        and data.get("type") == HEARTBEAT_EVENT_TYPE
+                    ):
+                        if bg_task is not None:
+                            await registry.note_alive(bg_task)
+                        continue
+                    if mode == "values":
+                        last_state = data
+                    elif mode == "messages" and forwarder is not None:
+                        # ``messages`` data is ``(message_chunk, metadata)``.
+                        # The metadata carries ``langgraph_node`` which lets the
+                        # forwarder drop tool-internal LLM chunks. Duck-typed (no
+                        # isinstance) so mocks and any future BaseMessage subclasses
+                        # pass.
+                        if isinstance(data, tuple):
+                            # Symmetric guards: production LangGraph emits
+                            # 2-tuples for ``messages`` mode, but defending
+                            # both indices keeps an upstream contract change
+                            # from raising IndexError out of the iterator.
+                            chunk = data[0] if len(data) > 0 else None
+                            chunk_meta = data[1] if len(data) > 1 else None
+                        else:
+                            chunk = data
+                            chunk_meta = None
+                        if chunk is not None and hasattr(chunk, "content"):
+                            try:
+                                await forwarder.forward(chunk, chunk_meta)
+                            except Exception as exc:
+                                # Token forwarding must never break the subagent.
+                                logger.debug(
+                                    "Subagent token forwarding failed",
+                                    error=str(exc),
+                                )
+                    elif mode == "custom" and forwarder is not None:
+                        try:
+                            await forwarder.forward_custom(data)
+                        except Exception as exc:
+                            logger.debug(
+                                "Subagent custom-event forwarding failed",
+                                error=str(exc),
+                            )
+            finally:
+                # Leaving the loop early leaves the graph suspended mid-step,
+                # its model call or tools running on until the garbage
+                # collector closes it. Closed here, within a bound, a stop
+                # ends the work it stops before the run settles.
+                await aclose_within(
+                    stream,
+                    SUBAGENT_CLOSE_TIMEOUT_S,
+                    label=f"the subagent stream for {tool_call_id}",
+                )
+    except Exception as exc:
+        # Every subagent run is nested, so LangGraph raises an interrupt here
+        # instead of ending the stream. Task HITL is unsupported, and this is
+        # its one explicit signal besides the error record below.
+        if isinstance(exc, GraphInterrupt):
+            logger.error(
+                "Unsupported interrupt from a background subagent",
+                tool_call_id=tool_call_id,
+                task_id=getattr(bg_task, "task_id", None),
+            )
+        # Spill an ``error`` SSE record so per-task consumers can tell a
+        # crashed subagent apart from a clean completion. ``asyncio.CancelledError``
+        # (BaseException) skips this path on purpose — cancellation is an
+        # orderly stop, not a content-level error; the registry's ``cancelled``
+        # flag already distinguishes it.
+        if forwarder is not None:
+            await forwarder.forward_error(exc)
+        raise
+    finally:
+        if forwarder is not None:
+            try:
+                await forwarder.finalize()
+            except Exception:
+                pass
+
+    return last_state if last_state is not None else {}
+
+
+def _unknown_type_refusal(
+    effective_type: str, roster: Iterable[str], *, resuming: bool
+) -> str:
+    """Why a Task names a subagent this build did not compile.
+
+    A resumed task outlives the roster it started on: its subagent may have
+    been deleted, renamed or turned off since, or serve only the other role,
+    and saying so tells the model not to retry under the same name.
+    """
+    allowed_types = ", ".join([f"`{k}`" for k in roster])
+    if resuming:
+        return (
+            f"Cannot resume: subagent `{effective_type}` was deleted, renamed, "
+            f"turned off, or isn't available to this agent. "
+            f"Available types: {allowed_types}"
+        )
+    return (
+        f"We cannot invoke subagent {effective_type} because it does not exist, "
+        f"the only allowed types are {allowed_types}"
+    )
+
+
+def _launch_refusal(reason: str, runtime: Any) -> "str | ToolMessage":
+    """A Task refusal the frontend can settle on.
+
+    Nothing starts, so no channel will ever close to settle the launch card:
+    the reply is the only signal it has, and it carries the failure status
+    rather than riding on the default success. Without a tool_call_id there is
+    no ToolMessage to build, so the text falls back to the caller's default.
+    """
+    tool_call_id = getattr(runtime, "tool_call_id", None)
+    if not tool_call_id:
+        return reason
+    return ToolMessage(
+        content=reason, tool_call_id=tool_call_id, name="Task", status="error"
+    )
+
+
+def _run_opener(prompt: str, task_id: str) -> HumanMessage:
+    """The message a resumed run of ``task_id`` opens with. A resume for
+    messages the last run never read carries them as delivered steers, for
+    replay to show as its live stream did, and the rows the resume handed
+    this run, which its first model call confirms (``SubagentSteeringMiddleware``)
+    once this message is checkpointed. Not marked as steering, so it still
+    opens a run."""
+    kwargs: dict[str, Any] = {}
+    delivered = steer_resume_for(task_id)
+    if delivered:
+        kwargs["steering_delivered"] = delivered
+    held = steer_resume_held(task_id)
+    if held:
+        kwargs["held_jobs"] = held
+    return HumanMessage(content=prompt, additional_kwargs=kwargs)
+
+
+def return_command_with_state_update(result: dict, tool_call_id: str) -> Command:
+    """Convert a subagent's final state into the parent-facing ToolMessage Command."""
+    # Validate that the result contains a 'messages' key
+    if "messages" not in result:
+        error_msg = (
+            "CompiledSubAgent must return a state containing a 'messages' key. "
+            "Custom StateGraphs used with CompiledSubAgent should include 'messages' "
+            "in their state schema to communicate results back to the main agent."
+        )
+        raise ValueError(error_msg)
+
+    state_update = {
+        k: v for k, v in result.items() if k not in _EXCLUDED_STATE_KEYS
+    }
+    # The answer is the last thing the subagent said, which is not always the
+    # last message: a run the repeat guard ends on refused calls stops on the
+    # refusal, and handing that back would pass the harness's words off as the
+    # answer. Read the way the durable result is (``resolve_task_result_text``),
+    # so TaskOutput gives the same answer from either. Trailing whitespace is
+    # stripped to prevent API errors with Anthropic.
+    message_text = next(
+        (
+            message.text.rstrip()
+            for message in reversed(result["messages"])
+            if getattr(message, "type", None) == "ai" and message.text.strip()
+        ),
+        "",
+    )
+    return Command(
+        update={
+            **state_update,
+            "messages": [ToolMessage(message_text, tool_call_id=tool_call_id)],
+        }
+    )
+
+
+def _create_task_tool(
+    *,
+    subagent_graphs: dict[str, Any],
+    task_description: str = TASK_TOOL_DESCRIPTION,
+    registry: BackgroundTaskRegistry | None = None,
+    checkpointer: Any | None = None,
+) -> BaseTool:
+    """Build a StructuredTool that dispatches Task tool calls to compiled subagents.
+
+    ``subagent_graphs`` are pre-compiled via ``_get_subagents`` by the caller
+    (``SubAgentMiddleware``) so the Task tool and any direct dispatch path
+    invoke the same graph instances.
+    """
+
+    async def _arun_subagent_streaming(
+        subagent: Runnable,
+        state: dict,
+        config: dict,
+    ) -> dict:
+        return await arun_subagent_streaming(
+            subagent, state, config, registry=registry
+        )
+
+    def _validate_and_prepare_state(
+        subagent_type: str, prompt: str, runtime: ToolRuntime
+    ) -> tuple[Runnable, dict]:
+        subagent = subagent_graphs[subagent_type]
+        # Create a new state dict to avoid mutating the original
+        subagent_state = {
+            k: v for k, v in runtime.state.items() if k not in _EXCLUDED_STATE_KEYS
+        }
+        subagent_state["messages"] = [HumanMessage(content=prompt)]
+        return subagent, subagent_state
+
+    def _get_background_task_context() -> tuple[str | None, str | None]:
+        """Return ``(checkpoint_ns, subagent_type)`` for the active BackgroundTask, or ``(None, None)``."""
+        if registry is None:
+            return None, None
+        bg_task_id = current_background_tool_call_id.get()
+        if not bg_task_id:
+            return None, None
+        bg_task = registry.get_by_tool_call_id(bg_task_id)
+        if bg_task and bg_task.completed is False:
+            return f"task:{bg_task.task_id}", bg_task.subagent_type
+        return None, None
+
+    def _subagent_run_metadata(effective_type: str, prompt: str) -> dict[str, Any]:
+        """Child-graph config metadata; carries the execution's ledger
+        identity (task_run_id) so checkpoints written by this run stamp it
+        into CheckpointMetadata — the replay-side attribution join key."""
+        md: dict[str, Any] = {
+            "subagent_type": effective_type,
+            "description": prompt[:200],
+        }
+        bg_tool_call_id = current_background_tool_call_id.get()
+        bg_task = (
+            registry.get_by_tool_call_id(bg_tool_call_id)
+            if bg_tool_call_id and registry
+            else None
+        )
+        if bg_task is not None and bg_task.task_run_id:
+            md["task_run_id"] = bg_task.task_run_id
+        return md
+
+    def task(
+        description: Annotated[
+            str,
+            "Short 1-2 sentence summary of the task (displayed as title)",
+        ],
+        prompt: Annotated[
+            str,
+            "Detailed instructions for the subagent to execute",
+        ],
+        subagent_type: Annotated[
+            str | None,
+            "The type of subagent to use. Required for init action.",
+        ] = None,
+        action: Annotated[
+            str,
+            "'init' (default), 'update', or 'resume'",
+        ] = "init",
+        task_id: Annotated[
+            str | None,
+            "Task ID. Required for update and resume actions.",
+        ] = None,
+        runtime: ToolRuntime = None,  # type: ignore[assignment]
+    ) -> str | ToolMessage | Command:
+        # Resolve subagent_type based on action
+        effective_type = subagent_type
+        if action == "update" or action == "resume":
+            # For resume/follow-up, type is inferred; validate if explicitly provided
+            _bg_checkpoint_ns, resume_type = _get_background_task_context()
+            effective_type = effective_type or resume_type or "general-purpose"
+            if effective_type not in subagent_graphs:
+                return _launch_refusal(
+                    _unknown_type_refusal(
+                        effective_type, subagent_graphs, resuming=action == "resume"
+                    ),
+                    runtime,
+                )
+        else:
+            # action == "init" (default)
+            if effective_type is None:
+                return _launch_refusal(
+                    "Error: subagent_type is required for new tasks.", runtime
+                )
+            if effective_type not in subagent_graphs:
+                return _launch_refusal(
+                    _unknown_type_refusal(effective_type, subagent_graphs, resuming=False),
+                    runtime,
+                )
+
+        subagent, subagent_state = _validate_and_prepare_state(
+            effective_type, prompt, runtime
+        )
+
+        # Build config: use parent's thread_id + checkpoint_ns for isolation.
+        # Only the background tracker is named explicitly; the launcher's
+        # callbacks are kept out by detaching, as on the async path.
+        raw_parent_config = get_config()
+        parent_config = {k: v for k, v in raw_parent_config.items() if k != "callbacks"}
+        parent_configurable = {
+            k: v
+            for k, v in parent_config.get("configurable", {}).items()
+            if k not in PARENT_RUN_STATE_KEYS
+        }
+
+        if checkpointer:
+            # Get task_id from BackgroundTask via ContextVar
+            bg_tool_call_id = current_background_tool_call_id.get()
+            bg_task = (
+                registry.get_by_tool_call_id(bg_tool_call_id)
+                if bg_tool_call_id and registry
+                else None
+            )
+            checkpoint_ns = f"task:{bg_task.task_id}" if bg_task else ""
+            config = {
+                **parent_config,
+                "configurable": {
+                    **parent_configurable,
+                    "thread_id": parent_configurable.get("thread_id", ""),
+                    "checkpoint_ns": checkpoint_ns,
+                },
+                "metadata": _subagent_run_metadata(effective_type, prompt),
+            }
+        else:
+            config = {}
+
+        bg_tracker = current_background_token_tracker.get(None)
+        if bg_tracker is not None:
+            if not config:
+                config = {}
+            config["callbacks"] = [bg_tracker]
+
+        with _detached_from_launcher():
+            result = subagent.invoke(
+                subagent_state, _without_stream_tee(with_run_tracer(config))
+            )
+        if not runtime.tool_call_id:
+            value_error_msg = "Tool call ID is required for subagent invocation"
+            raise ValueError(value_error_msg)
+        return return_command_with_state_update(result, runtime.tool_call_id)
+
+    async def atask(
+        description: Annotated[
+            str,
+            "Short 1-2 sentence summary of the task (displayed as title)",
+        ],
+        prompt: Annotated[
+            str,
+            "Detailed instructions for the subagent to execute",
+        ],
+        subagent_type: Annotated[
+            str | None,
+            "The type of subagent to use. Required for init action.",
+        ] = None,
+        action: Annotated[
+            str,
+            "'init' (default), 'update', or 'resume'",
+        ] = "init",
+        task_id: Annotated[
+            str | None,
+            "Task ID. Required for update and resume actions.",
+        ] = None,
+        runtime: ToolRuntime = None,  # type: ignore[assignment]
+    ) -> str | ToolMessage | Command:
+        # Resolve subagent_type based on action
+        effective_type = subagent_type
+
+        # Set for both init and resume of managed background tasks.
+        bg_checkpoint_ns, resume_type = _get_background_task_context()
+        has_bg_task_context = bg_checkpoint_ns is not None
+
+        if action == "update" or action == "resume" or has_bg_task_context:
+            # For resume/follow-up, type is inferred; validate if explicitly provided
+            effective_type = effective_type or resume_type or "general-purpose"
+            if effective_type not in subagent_graphs:
+                return _launch_refusal(
+                    _unknown_type_refusal(
+                        effective_type, subagent_graphs, resuming=action == "resume"
+                    ),
+                    runtime,
+                )
+        else:
+            # action == "init" (default)
+            if effective_type is None:
+                return _launch_refusal(
+                    "Error: subagent_type is required for new tasks.", runtime
+                )
+            if effective_type not in subagent_graphs:
+                return _launch_refusal(
+                    _unknown_type_refusal(effective_type, subagent_graphs, resuming=False),
+                    runtime,
+                )
+
+        subagent = subagent_graphs[effective_type]
+
+        # Start from the parent config for its configurable and tags, minus
+        # its callbacks: the run names only its own tracker, and
+        # arun_subagent_streaming detaches it from the launcher and adds its
+        # LangSmith tracer, which nests under the launcher's run through the
+        # SDK's ContextVar, so dropping the explicit callbacks list does not
+        # affect coverage.
+        raw_parent_config: dict[str, Any] = dict(get_config())
+        parent_config: dict[str, Any] = {
+            k: v for k, v in raw_parent_config.items() if k != "callbacks"
+        }
+        parent_configurable: dict[str, Any] = {
+            k: v
+            for k, v in parent_config.get("configurable", {}).items()
+            if k not in PARENT_RUN_STATE_KEYS
+        }
+
+        def _compose_callbacks() -> list[Any]:
+            bg_tracker = current_background_token_tracker.get(None)
+            return [bg_tracker] if bg_tracker is not None else []
+
+        if has_bg_task_context and checkpointer:
+            # Per-task checkpoint_ns; LangGraph hydrates from prior checkpoint if present.
+            invoke_state = {
+                k: v for k, v in runtime.state.items() if k not in _EXCLUDED_STATE_KEYS
+            }
+            invoke_state["messages"] = [
+                _run_opener(prompt, bg_checkpoint_ns.removeprefix("task:"))
+            ]
+            config = {
+                **parent_config,
+                "configurable": {
+                    **parent_configurable,
+                    "thread_id": parent_configurable.get("thread_id", ""),
+                    "checkpoint_ns": bg_checkpoint_ns,
+                },
+                "metadata": _subagent_run_metadata(effective_type, prompt),
+            }
+            callbacks = _compose_callbacks()
+            if callbacks:
+                config["callbacks"] = callbacks
+
+            logger.info(
+                "Invoking subagent with task checkpoint_ns",
+                checkpoint_ns=bg_checkpoint_ns,
+                parent_thread_id=parent_configurable.get("thread_id", ""),
+                subagent_type=effective_type,
+            )
+            result = await _arun_subagent_streaming(subagent, invoke_state, config)
+        else:
+            # New task: use parent's thread_id + checkpoint_ns for isolation
+            _subagent, subagent_state = _validate_and_prepare_state(
+                effective_type, prompt, runtime
+            )
+            if checkpointer:
+                # Get task_id from BackgroundTask via ContextVar
+                bg_tool_call_id = current_background_tool_call_id.get()
+                bg_task = (
+                    registry.get_by_tool_call_id(bg_tool_call_id)
+                    if bg_tool_call_id and registry
+                    else None
+                )
+                checkpoint_ns = f"task:{bg_task.task_id}" if bg_task else ""
+                config = {
+                    **parent_config,
+                    "configurable": {
+                        **parent_configurable,
+                        "thread_id": parent_configurable.get("thread_id", ""),
+                        "checkpoint_ns": checkpoint_ns,
+                    },
+                    "metadata": _subagent_run_metadata(effective_type, prompt),
+                }
+            else:
+                config = {}
+
+            callbacks = _compose_callbacks()
+            if callbacks:
+                if not config:
+                    config = {}
+                config["callbacks"] = callbacks
+
+            result = await _arun_subagent_streaming(subagent, subagent_state, config)
+
+        if not runtime.tool_call_id:
+            value_error_msg = "Tool call ID is required for subagent invocation"
+            raise ValueError(value_error_msg)
+        return return_command_with_state_update(result, runtime.tool_call_id)
+
+    return StructuredTool.from_function(
+        name="Task",
+        func=task,
+        coroutine=atask,
+        description=task_description,
+    )
+
+
+class SubAgentMiddleware(AgentMiddleware):
+    """Middleware for providing subagents to an agent via a `Task` tool.
+
+    This  middleware adds a `Task` tool to the agent that can be used to invoke subagents.
+    Subagents are useful for handling complex tasks that require multiple steps, or tasks
+    that require a lot of context to resolve.
+
+    A chief benefit of subagents is that they can handle multi-step tasks, and then return
+    a clean, concise response to the main agent.
+
+    Subagents are also great for different domains of expertise that require a narrower
+    subset of tools and focus.
+
+    This middleware comes with a default general-purpose subagent that can be used to
+    handle the same tasks as the main agent, but with isolated context.
+
+    Args:
+        default_model: The model to use for subagents.
+
+            Can be a `LanguageModelLike` or a dict for `init_chat_model`.
+        default_tools: The tools to use for the default general-purpose subagent.
+        default_middleware: Default middleware to apply to all subagents.
+
+            If `None`, no default middleware is applied.
+
+            Pass a list to specify custom middleware.
+        default_interrupt_on: The tool configs to use for the default general-purpose subagent.
+
+            These are also the fallback for any subagents that don't specify their own tool configs.
+        subagents: A list of additional subagents to provide to the agent.
+        system_prompt: Additional system prompt to append. When provided, appended to
+            the agent's system message via middleware.
+        general_purpose_agent: Whether to include the general-purpose agent.
+        task_description: Description for the Task tool.
+
+    Example:
+        ```python
+        from ptc_agent.agent.middleware.background_subagent.subagent_middleware import SubAgentMiddleware
+        from langchain.agents import create_agent
+
+        # Basic usage with defaults (no default middleware)
+        agent = create_agent(
+            "openai:gpt-4o",
+            middleware=[
+                SubAgentMiddleware(
+                    default_model="openai:gpt-4o",
+                    subagents=[],
+                )
+            ],
+        )
+
+        # Add custom middleware to subagents
+        agent = create_agent(
+            "openai:gpt-4o",
+            middleware=[
+                SubAgentMiddleware(
+                    default_model="openai:gpt-4o",
+                    default_middleware=[TodoListMiddleware()],
+                    subagents=[],
+                )
+            ],
+        )
+        ```
+    """
+
+    def __init__(
+        self,
+        *,
+        default_model: str | BaseChatModel,
+        default_tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,
+        default_middleware: list[AgentMiddleware] | None = None,
+        default_interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
+        subagents: list[SubAgent | CompiledSubAgent] | None = None,
+        system_prompt: str | None = None,
+        general_purpose_agent: bool = True,
+        task_description: str = TASK_TOOL_DESCRIPTION,
+        registry: BackgroundTaskRegistry | None = None,
+        checkpointer: Any | None = None,
+    ) -> None:
+        super().__init__()
+        self.system_prompt = system_prompt
+        # Compiled once and shared: the Task tool and any direct dispatch
+        # path (e.g. the workflow driver) must invoke the SAME graph
+        # instances so model resolution and middleware wiring are identical.
+        self.subagent_graphs, _ = _get_subagents(
+            default_model=default_model,
+            default_tools=default_tools or [],
+            default_middleware=default_middleware,
+            default_interrupt_on=default_interrupt_on,
+            subagents=subagents or [],
+            general_purpose_agent=general_purpose_agent,
+            checkpointer=checkpointer,
+        )
+        task_tool = _create_task_tool(
+            subagent_graphs=self.subagent_graphs,
+            task_description=task_description,
+            registry=registry,
+            checkpointer=checkpointer,
+        )
+        self.tools = [task_tool]
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        if self.system_prompt is not None:
+            new_system_message = append_to_system_message(
+                request.system_message, self.system_prompt
+            )
+            return handler(request.override(system_message=new_system_message))
+        return handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        if self.system_prompt is not None:
+            new_system_message = append_to_system_message(
+                request.system_message, self.system_prompt
+            )
+            return await handler(request.override(system_message=new_system_message))
+        return await handler(request)

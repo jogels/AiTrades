@@ -1,0 +1,71 @@
+/* Sources panel — provenance card deck.
+ *
+ * Mirrors the widget-context deck's fan/collapse motion (`.widget-deck-*` in
+ * chat-input.css) one-for-one — same easing curve, same durations — so a
+ * provenance stack expands identically to the chat-input snapshot deck. The
+ * per-card top/transform/opacity are set inline (they depend on index + fan
+ * state); these rules supply only the transitions and the entrance animation. */
+.source-deck-stack {
+  position: relative;
+  transition: height var(--motion-fold) var(--ease-out);
+}
+
+.source-deck-card {
+  /* The whole offset rides `transform`, which is what the transition below
+     animates; a card moved by `top` would jump to its fanned slot. */
+  top: 0;
+  transition:
+    transform var(--motion-fold) var(--ease-out),
+    opacity var(--motion-fold) var(--ease-out),
+    box-shadow var(--motion-quick) var(--ease-out);
+  animation: sourceDeckCardIn var(--motion-enter) var(--ease-out);
+}
+
+@keyframes sourceDeckCardIn {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.96);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .source-deck-stack,
+  .source-deck-card {
+    transition: none;
+    animation: none;
+  }
+}
+
+/* Detail dialog — staggered reveal of the fingerprint sections. Radix handles
+ * the container zoom; this fades each section in sequence so the evidence reads
+ * top-to-bottom (spec card → arguments → snippet).
+ *
+ * Opacity only — deliberately NO transform. The sections live inside the
+ * dialog's `max-h-[60vh] overflow-y-auto` body; a `translateY` entrance briefly
+ * extends the body's scrollHeight past that cap, flashing a vertical scrollbar
+ * that snaps the inner column ~15px narrower then back. Opacity never touches
+ * layout, so the reveal can't trigger that resize. */
+.source-detail-body > * {
+  animation: sourceDetailIn var(--motion-enter) var(--ease-out) both;
+}
+.source-detail-body > *:nth-child(1) {
+  animation-delay: var(--motion-stagger);
+}
+.source-detail-body > *:nth-child(2) {
+  animation-delay: calc(2 * var(--motion-stagger));
+}
+.source-detail-body > *:nth-child(3) {
+  animation-delay: calc(3 * var(--motion-stagger));
+}
+
+@keyframes sourceDetailIn {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .source-detail-body > * {
+    animation: none;
+  }
+}

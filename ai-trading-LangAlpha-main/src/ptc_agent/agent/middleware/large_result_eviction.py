@@ -1,0 +1,285 @@
+"""Middleware for evicting large tool results to filesystem.
+
+This middleware intercepts tool call results and evicts them to the filesystem
+when they exceed a token threshold, preventing context window overflow.
+"""
+
+from collections.abc import Awaitable, Callable
+
+from langchain.agents.middleware.types import AgentMiddleware
+from langchain.tools import ToolRuntime
+from langchain.tools.tool_node import ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langgraph.types import Command
+
+from deepagents.backends.protocol import BackendProtocol
+from deepagents.backends.utils import (
+    format_content_with_line_numbers,
+    sanitize_tool_call_id,
+)
+from ptc_agent.core.paths import WorkspaceLayout
+from src.llms.attachment_payload import has_attachment
+
+# Approximate number of characters per token for truncation calculations.
+# Using 4 chars per token as a conservative approximation (actual ratio varies by content)
+NUM_CHARS_PER_TOKEN = 4
+
+# Evicted results are backed up with the workspace, and a strict backup aborts
+# on any file its transfer path cannot store (100 MiB inline, 256 MiB relayed).
+# Half the smallest leaves headroom and is still far past anything a model
+# reads in slices.
+MAX_EVICTED_BYTES = 50 * 1024 * 1024
+
+# Tools excluded from eviction (PascalCase versions of the original snake_case tools)
+# These either have built-in truncation or are problematic to evict.
+# Glob and Grep are deliberately NOT excluded: Glob self-caps (GLOB_MATCH_LIMIT) and
+# Grep cuts each long line (GREP_LINE_CHARS), but neither bounds how many results
+# come back. Eviction stays as the backstop that keeps a pathological result from
+# reaching the model, the same protection Bash already relies on.
+TOOLS_EXCLUDED_FROM_EVICTION = (
+    "Read",  # Problematic truncation behavior (single long lines)
+    "Write",  # Returns minimal confirmation
+    "Edit",  # Returns minimal confirmation
+)
+
+# Message template for evicted tool results
+TOO_LARGE_TOOL_MSG = """Tool result too large, the result of this tool call {tool_call_id} was saved in the filesystem at this path: {file_path}
+You can read the result from the filesystem by using the Read tool, but make sure to only read part of the result at a time.
+You can do this by specifying an offset and limit in the Read tool call.
+For example, to read the first 100 lines, you can use the Read tool with offset=0 and limit=100.
+
+Here is a preview showing the head and tail of the result (lines of the form
+... [N lines truncated] ...
+indicate omitted lines in the middle of the content):
+
+{content_sample}
+"""
+
+
+def _create_content_preview(
+    content_str: str, *, head_lines: int = 5, tail_lines: int = 5
+) -> str:
+    """Create a preview of content showing head and tail with truncation marker.
+
+    Args:
+        content_str: The full content string to preview.
+        head_lines: Number of lines to show from the start.
+        tail_lines: Number of lines to show from the end.
+
+    Returns:
+        Formatted preview string with line numbers.
+    """
+    lines = content_str.splitlines()
+
+    if len(lines) <= head_lines + tail_lines:
+        # If file is small enough, show all lines
+        preview_lines = [line[:1000] for line in lines]
+        return format_content_with_line_numbers(preview_lines, start_line=1)
+
+    # Show head and tail with truncation marker
+    head = [line[:1000] for line in lines[:head_lines]]
+    tail = [line[:1000] for line in lines[-tail_lines:]]
+
+    head_sample = format_content_with_line_numbers(head, start_line=1)
+    truncation_notice = (
+        f"\n... [{len(lines) - head_lines - tail_lines} lines truncated] ...\n"
+    )
+    tail_sample = format_content_with_line_numbers(
+        tail, start_line=len(lines) - tail_lines + 1
+    )
+
+    return head_sample + truncation_notice + tail_sample
+
+
+def _cap_evicted(content_str: str) -> tuple[str, int | None]:
+    """The part of an evicted result that is kept, and its full size if cut."""
+    if len(content_str) * 4 <= MAX_EVICTED_BYTES:
+        return content_str, None
+    raw = content_str.encode()
+    if len(raw) <= MAX_EVICTED_BYTES:
+        return content_str, None
+    return raw[:MAX_EVICTED_BYTES].decode(errors="ignore"), len(raw)
+
+
+def _detect_extension(content_str: str) -> str:
+    """Detect file extension based on content.
+
+    Returns '.json' if content looks like JSON (starts with '{' or '['),
+    otherwise returns '.md'.
+    """
+    stripped = content_str.lstrip()
+    if stripped and stripped[0] in ("{", "["):
+        return ".json"
+    return ".md"
+
+
+class LargeResultEvictionMiddleware(AgentMiddleware):
+    """Middleware for evicting large tool results to filesystem.
+
+    This middleware intercepts tool call results and evicts them to the filesystem
+    when they exceed a token threshold, preventing context window overflow.
+
+    The evicted content is written to {eviction_dir}/{tool_call_id} and the
+    original message is replaced with a truncated preview plus file reference.
+
+    Args:
+        backend: Backend for file storage (must implement BackendProtocol).
+        tool_token_limit_before_evict: Token limit before evicting a tool result.
+            Default is 40000 tokens (~160000 characters).
+    """
+
+    def __init__(
+        self,
+        *,
+        backend: BackendProtocol,
+        tool_token_limit_before_evict: int = 40000,
+        eviction_dir: str = WorkspaceLayout.LARGE_TOOL_RESULTS_DIR,
+    ) -> None:
+        """Initialize the large result eviction middleware.
+
+        Args:
+            backend: Backend for file storage.
+            tool_token_limit_before_evict: Token limit before evicting results.
+            eviction_dir: Directory path for evicted tool results.
+        """
+        self.backend = backend
+        self._tool_token_limit_before_evict = tool_token_limit_before_evict
+        self._eviction_dir = eviction_dir
+
+    async def _aprocess_large_message(
+        self,
+        message: ToolMessage,
+    ) -> ToolMessage:
+        """Evict an oversized tool result to a file, leaving a pointer in its place.
+
+        Returns the message untouched when eviction is off, the result fits, or
+        the write failed — the model sees the original rather than losing it.
+        """
+        # Early exit if eviction not configured
+        if not self._tool_token_limit_before_evict:
+            return message
+
+        # A result carrying an attachment cannot be evicted: eviction replaces
+        # content with a path, and a path is not something a model can look at.
+        # Read is excluded from eviction entirely, so this is unreachable today;
+        # it is here because the moment any other tool answers with an image or
+        # a PDF, the fallback below would stringify its base64 and the size
+        # check would then send the whole thing to a file.
+        if has_attachment(message.content):
+            return message
+
+        # Convert content to string once for both size check and eviction
+        if (
+            isinstance(message.content, list)
+            and len(message.content) == 1
+            and isinstance(message.content[0], dict)
+            and message.content[0].get("type") == "text"
+            and "text" in message.content[0]
+        ):
+            content_str = str(message.content[0]["text"])
+        elif isinstance(message.content, str):
+            content_str = message.content
+        else:
+            content_str = str(message.content)
+
+        if (
+            len(content_str)
+            <= NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict
+        ):
+            return message
+
+        # Write content to filesystem using async method
+        sanitized_id = sanitize_tool_call_id(message.tool_call_id)
+        file_path = f"{self._eviction_dir}/{sanitized_id}{_detect_extension(content_str)}"
+        # Middleware rewrites by-id paths (same tool_call_id retries overwrite prior eviction);
+        # opt out of protocol's create-only default.
+        kept, full_size = _cap_evicted(content_str)
+        result = await self.backend.awrite(file_path, kept, overwrite=True)
+        if result is None or result.error:
+            return message
+
+        # Create preview showing head and tail of the result
+        content_sample = _create_content_preview(content_str)
+        replacement_text = TOO_LARGE_TOOL_MSG.format(
+            tool_call_id=message.tool_call_id,
+            file_path=file_path,
+            content_sample=content_sample,
+        )
+        if full_size is not None:
+            replacement_text += (
+                f"\nThe file holds only the first {MAX_EVICTED_BYTES // 2**20} MiB "
+                f"of this {full_size / 2**20:.0f} MiB result.\n"
+            )
+
+        # Preserve artifact from content_and_artifact tools
+        # The eviction rebuilds the message, so anything not copied here is
+        # silently reset to its default. `status` is the one field a consumer
+        # cannot recover from the replacement text: a failure whose result was
+        # too large would land as a success.
+        kwargs = dict(
+            content=replacement_text,
+            tool_call_id=message.tool_call_id,
+            name=message.name,
+            status=message.status,
+        )
+        if hasattr(message, 'artifact') and message.artifact is not None:
+            kwargs['artifact'] = message.artifact
+        return ToolMessage(**kwargs)
+
+    async def _aintercept_large_tool_result(
+        self, tool_result: ToolMessage | Command, runtime: ToolRuntime
+    ) -> ToolMessage | Command:
+        """Swap oversized results for pointers, in a bare message or inside a Command."""
+        if isinstance(tool_result, ToolMessage):
+            return await self._aprocess_large_message(tool_result)
+
+        if isinstance(tool_result, Command):
+            update = tool_result.update
+            if update is None:
+                return tool_result
+            command_messages = update.get("messages", [])
+            processed_messages = []
+            for message in command_messages:
+                if not isinstance(message, ToolMessage):
+                    processed_messages.append(message)
+                    continue
+                processed_messages.append(
+                    await self._aprocess_large_message(message)
+                )
+            return Command(
+                update={
+                    **update,
+                    "messages": processed_messages,
+                    # Copied, and defaulted in when the tool sent no files key —
+                    # eviction contributes nothing here (the write is the
+                    # backend's own business), but a Command that arrived
+                    # without `files` has always left with an empty one.
+                    "files": dict(update.get("files", {})),
+                }
+            )
+        raise AssertionError(
+            f"Unreachable code in _aintercept_large_tool_result: tool_result type {type(tool_result)}"
+        )
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
+    ) -> ToolMessage | Command:
+        """Async version: check size and evict to filesystem if too large.
+
+        Args:
+            request: The tool call request being processed.
+            handler: The async handler function to call with the request.
+
+        Returns:
+            The raw ToolMessage, or a Command with evicted content.
+        """
+        if (
+            self._tool_token_limit_before_evict is None
+            or request.tool_call["name"] in TOOLS_EXCLUDED_FROM_EVICTION
+        ):
+            return await handler(request)
+
+        tool_result = await handler(request)
+        return await self._aintercept_large_tool_result(tool_result, request.runtime)

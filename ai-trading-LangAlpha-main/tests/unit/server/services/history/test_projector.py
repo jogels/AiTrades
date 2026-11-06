@@ -1,0 +1,1100 @@
+"""Golden tests for the checkpoint→SSE projector (pure, no I/O)."""
+
+from __future__ import annotations
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+from src.server.services.history.projector import (
+    HistoryEvent,
+    history_events_to_sse,
+    messages_to_history_events,
+)
+
+THREAD_ID = "thread-test"
+
+
+def _sse(messages, agent="main"):
+    return history_events_to_sse(
+        messages_to_history_events(messages, agent=agent), thread_id=THREAD_ID
+    )
+
+
+def test_plain_text_message():
+    items = _sse([AIMessage(content="hello world", id="ai-1")])
+    assert items == [
+        {
+            "event": "message_chunk",
+            "data": {
+                "thread_id": THREAD_ID,
+                "agent": "main",
+                "id": "ai-1",
+                "role": "assistant",
+                "content": "hello world",
+                "content_type": "text",
+                "finish_reason": "stop",
+            },
+        }
+    ]
+
+
+def test_human_messages_skipped():
+    items = _sse(
+        [HumanMessage(content="question", id="h-1"), AIMessage(content="answer", id="ai-1")]
+    )
+    assert len(items) == 1
+    assert items[0]["data"]["content"] == "answer"
+
+
+def test_reasoning_blocks_split_from_text():
+    msg = AIMessage(
+        content=[
+            {"type": "thinking", "thinking": "let me think"},
+            {"type": "text", "text": "the answer"},
+        ],
+        id="ai-1",
+    )
+    items = _sse([msg])
+    kinds = [(i["data"].get("content_type"), i["data"].get("content")) for i in items]
+    assert kinds == [
+        ("reasoning_signal", "start"),
+        ("reasoning", "let me think"),
+        ("reasoning_signal", "complete"),
+        ("text", "the answer"),
+    ]
+    assert items[-1]["data"]["finish_reason"] == "stop"
+
+
+def test_text_phase_rides_the_replayed_chunk():
+    msg = AIMessage(
+        content=[{"type": "text", "text": "the answer", "phase": "final_answer"}],
+        id="ai-1",
+    )
+    items = _sse([msg])
+    assert items[0]["data"]["phase"] == "final_answer"
+
+
+def test_disagreeing_text_phases_omit_the_key():
+    # The blocks are joined into one chunk, so a single phase would misdescribe
+    # half of it. Splitting the run per phase is a later change.
+    msg = AIMessage(
+        content=[
+            {"type": "text", "text": "hold on ", "phase": "commentary"},
+            {"type": "text", "text": "the answer", "phase": "final_answer"},
+        ],
+        id="ai-1",
+    )
+    items = _sse([msg])
+    assert items[0]["data"]["content"] == "hold on the answer"
+    assert "phase" not in items[0]["data"]
+
+
+def test_a_phaseless_block_beside_a_phased_one_omits_the_key():
+    msg = AIMessage(
+        content=[
+            {"type": "text", "text": "hold on ", "phase": "commentary"},
+            {"type": "text", "text": "the answer"},
+        ],
+        id="ai-1",
+    )
+    items = _sse([msg])
+    assert "phase" not in items[0]["data"]
+
+
+def test_phaseless_text_omits_the_key():
+    items = _sse([AIMessage(content=[{"type": "text", "text": "plain"}], id="ai-1")])
+    assert "phase" not in items[0]["data"]
+
+
+def test_tool_call_suppresses_stop_finish():
+    msg = AIMessage(
+        content="running a tool",
+        id="ai-1",
+        tool_calls=[{"name": "web_search", "args": {"query": "x"}, "id": "tc-1"}],
+    )
+    items = _sse([msg])
+    assert items[0]["data"]["content"] == "running a tool"
+    assert "finish_reason" not in items[0]["data"]
+    assert items[1]["event"] == "tool_calls"
+    data = items[1]["data"]
+    assert data["finish_reason"] == "tool_calls"
+    assert data["role"] == "assistant"
+    assert data["id"] == "ai-1"
+    [tc] = data["tool_calls"]
+    assert (tc["name"], tc["args"], tc["id"]) == ("web_search", {"query": "x"}, "tc-1")
+
+
+def test_nameless_tool_calls_filtered():
+    msg = AIMessage(
+        content="",
+        id="ai-1",
+        tool_calls=[{"name": "", "args": {}, "id": "tc-0"}],
+    )
+    assert _sse([msg]) == []
+
+
+def test_tool_result_event():
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "web_search", "args": {}, "id": "tc-1"}],
+        ),
+        ToolMessage(content="result body", tool_call_id="tc-1", name="web_search", id="tm-1"),
+    ]
+    items = _sse(msgs)
+    result = items[-1]
+    assert result["event"] == "tool_call_result"
+    assert result["data"]["tool_call_id"] == "tc-1"
+    assert result["data"]["content"] == "result body"
+    assert result["data"]["content_type"] == "text"
+
+
+def test_error_status_rides_the_tool_result():
+    """A refused direct MCP call is a failure only its status reports.
+
+    Its content is prose the client must not have to classify, so the
+    projection carries the ToolMessage status the middleware stamped.
+    """
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[
+                {"name": "mcp__moomoo__trading_order_place", "args": {}, "id": "tc-r"}
+            ],
+        ),
+        ToolMessage(
+            content="Refused: trading is not enabled for this connection.",
+            tool_call_id="tc-r",
+            name="mcp__moomoo__trading_order_place",
+            id="tm-1",
+            status="error",
+        ),
+    ]
+    result = next(i for i in _sse(msgs) if i["event"] == "tool_call_result")["data"]
+    assert result["status"] == "error"
+
+
+def test_successful_tool_result_carries_its_status():
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "web_search", "args": {}, "id": "tc-1"}],
+        ),
+        ToolMessage(content="result body", tool_call_id="tc-1", name="web_search", id="tm-1"),
+    ]
+    result = next(i for i in _sse(msgs) if i["event"] == "tool_call_result")["data"]
+    assert result["status"] == "success"
+
+
+def test_successful_refusal_prose_from_a_direct_mcp_tool_keeps_its_success():
+    """The one shape the client cannot classify from prose alone.
+
+    A direct MCP tool whose successful output opens with "Refused:" reads as a
+    refusal to every prose heuristic, so the projection has to carry the
+    success the ToolMessage holds all the way through content normalization.
+    """
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "mcp__hiring__list_screens", "args": {}, "id": "tc-s"}],
+        ),
+        ToolMessage(
+            content="Refused: 7 applications",
+            tool_call_id="tc-s",
+            name="mcp__hiring__list_screens",
+            id="tm-1",
+        ),
+    ]
+    result = next(i for i in _sse(msgs) if i["event"] == "tool_call_result")["data"]
+    assert result["content"] == "Refused: 7 applications"
+    assert result["status"] == "success"
+
+
+def test_write_tool_derives_file_operation_artifact():
+    content = "line one\nline two\n"
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[
+                {
+                    "name": "Write",
+                    "args": {"file_path": "work/a.py", "content": content},
+                    "id": "tc-w",
+                }
+            ],
+        ),
+        ToolMessage(content="ok", tool_call_id="tc-w", name="Write", id="tm-1"),
+    ]
+    items = _sse(msgs)
+    # Live ordering: tool_calls → artifact → tool_call_result.
+    assert [i["event"] for i in items] == ["tool_calls", "artifact", "tool_call_result"]
+    artifact = items[1]["data"]
+    assert artifact["artifact_type"] == "file_operation"
+    assert artifact["artifact_id"] == "tc-w"
+    assert artifact["status"] == "completed"
+    assert artifact["payload"] == {
+        "operation": "Write",
+        "file_path": "work/a.py",
+        "line_count": 2,
+        "content": content,
+    }
+
+
+def test_write_tool_with_dict_content_coerced_to_json():
+    # A model writing a .json file often passes `content` as a dict, which the
+    # checkpoint stores raw. The projector must apply the same JSON coercion the
+    # live ToolArgumentParsingMiddleware does, not crash on the dict.
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[
+                {
+                    "name": "Write",
+                    "args": {"file_path": "data/config.json", "content": {"k": [1, 2]}},
+                    "id": "tc-w",
+                }
+            ],
+        ),
+        ToolMessage(content="ok", tool_call_id="tc-w", name="Write", id="tm-1"),
+    ]
+    artifact = next(i for i in _sse(msgs) if i["event"] == "artifact")["data"]
+    assert artifact["payload"] == {
+        "operation": "Write",
+        "file_path": "data/config.json",
+        "line_count": 1,
+        "content": '{"k": [1, 2]}',
+    }
+
+
+def test_edit_tool_with_dict_strings_coerced_to_json():
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[
+                {
+                    "name": "Edit",
+                    "args": {
+                        "file_path": "data/config.json",
+                        "old_string": {"v": 1},
+                        "new_string": {"v": 2},
+                    },
+                    "id": "tc-e",
+                }
+            ],
+        ),
+        ToolMessage(content="ok", tool_call_id="tc-e", name="Edit", id="tm-1"),
+    ]
+    artifact = next(i for i in _sse(msgs) if i["event"] == "artifact")["data"]
+    assert artifact["payload"] == {
+        "operation": "Edit",
+        "file_path": "data/config.json",
+        "line_count": 1,
+        "old_string": '{"v": 1}',
+        "new_string": '{"v": 2}',
+    }
+
+
+def test_edit_tool_derives_file_operation_artifact():
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[
+                {
+                    "name": "Edit",
+                    "args": {
+                        "file_path": "work/a.py",
+                        "old_string": "before",
+                        "new_string": "after line",
+                    },
+                    "id": "tc-e",
+                }
+            ],
+        ),
+        ToolMessage(content="ok", tool_call_id="tc-e", name="Edit", id="tm-1"),
+    ]
+    artifact = next(i for i in _sse(msgs) if i["event"] == "artifact")["data"]
+    assert artifact["payload"] == {
+        "operation": "Edit",
+        "file_path": "work/a.py",
+        "line_count": 1,
+        "old_string": "before",
+        "new_string": "after line",
+    }
+
+
+def test_failed_tool_marks_artifact_failed():
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[
+                {"name": "Write", "args": {"file_path": "a", "content": "x"}, "id": "tc-w"}
+            ],
+        ),
+        ToolMessage(
+            content="boom", tool_call_id="tc-w", name="Write", id="tm-1", status="error"
+        ),
+    ]
+    artifact = next(i for i in _sse(msgs) if i["event"] == "artifact")["data"]
+    assert artifact["status"] == "failed"
+
+
+def test_todo_write_derives_todo_update():
+    todos = [
+        {"content": "a", "activeForm": "doing a", "status": "completed"},
+        {"content": "b", "status": "in_progress"},
+        {"content": "c", "status": "pending"},
+    ]
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "TodoWrite", "args": {"todos": todos}, "id": "tc-t"}],
+        ),
+        ToolMessage(content="ok", tool_call_id="tc-t", name="TodoWrite", id="tm-1"),
+    ]
+    artifact = next(i for i in _sse(msgs) if i["event"] == "artifact")["data"]
+    assert artifact["artifact_type"] == "todo_update"
+    assert artifact["payload"]["total"] == 3
+    assert artifact["payload"]["completed"] == 1
+    assert artifact["payload"]["in_progress"] == 1
+    assert artifact["payload"]["pending"] == 1
+    # activeForm defaults to content when absent.
+    assert artifact["payload"]["todos"][1]["activeForm"] == "b"
+
+
+def test_show_widget_artifact_from_tool_message():
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "ShowWidget", "args": {}, "id": "tc-s"}],
+        ),
+        ToolMessage(
+            content="widget shown",
+            tool_call_id="tc-s",
+            name="ShowWidget",
+            id="tm-1",
+            artifact={"html": "<div/>", "title": "My Widget"},
+        ),
+    ]
+    items = _sse(msgs)
+    artifact = next(i for i in _sse(msgs) if i["event"] == "artifact")["data"]
+    assert artifact["artifact_type"] == "html_widget"
+    assert artifact["artifact_id"] == "tc-s"
+    assert artifact["payload"] == {"html": "<div/>", "title": "My Widget"}
+    # ToolMessage.artifact also rides the tool_call_result, matching live SSE.
+    result = next(i for i in items if i["event"] == "tool_call_result")["data"]
+    assert result["artifact"] == {"html": "<div/>", "title": "My Widget"}
+
+
+def test_preview_url_artifact_id_from_port():
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "GetPreviewUrl", "args": {"port": 3000}, "id": "tc-p"}],
+        ),
+        ToolMessage(
+            content="url",
+            tool_call_id="tc-p",
+            name="GetPreviewUrl",
+            id="tm-1",
+            artifact={"port": 3000, "title": "app", "command": None, "path": "/"},
+        ),
+    ]
+    artifact = next(i for i in _sse(msgs) if i["event"] == "artifact")["data"]
+    assert artifact["artifact_type"] == "preview_url"
+    assert artifact["artifact_id"] == "preview_3000"
+
+
+def test_widget_tool_without_artifact_derives_nothing():
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "ShowWidget", "args": {}, "id": "tc-s"}],
+        ),
+        ToolMessage(content="failed", tool_call_id="tc-s", name="ShowWidget", id="tm-1"),
+    ]
+    assert [i["event"] for i in _sse(msgs)] == ["tool_calls", "tool_call_result"]
+
+
+def test_task_artifact_attributed_to_main():
+    task_artifact = {
+        "task_id": "abc123",
+        "action": "init",
+        "description": "research task",
+        "prompt": "go research",
+    }
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "Task", "args": {}, "id": "tc-task"}],
+        ),
+        ToolMessage(
+            content="dispatched",
+            tool_call_id="tc-task",
+            name="Task",
+            id="tm-1",
+            additional_kwargs={"task_artifact": task_artifact},
+        ),
+    ]
+    artifact = next(i for i in _sse(msgs, agent="other") if i["event"] == "artifact")["data"]
+    assert artifact["artifact_type"] == "task"
+    assert artifact["artifact_id"] == "task:abc123"
+    # Task cards always render under the main transcript, whatever projected the slice.
+    assert artifact["agent"] == "main"
+    assert artifact["payload"] == task_artifact
+    assert artifact["tool_call_id"] == "tc-task"
+
+
+def test_subagent_agent_label_propagates():
+    items = _sse([AIMessage(content="sub says hi", id="ai-1")], agent="task:abc123")
+    assert items[0]["data"]["agent"] == "task:abc123"
+
+
+def test_empty_content_key_dropped():
+    items = history_events_to_sse(
+        [HistoryEvent("text", "main", "ai-1", {"content": "", "finish_reason": "stop"})],
+        thread_id=THREAD_ID,
+    )
+    assert "content" not in items[0]["data"]
+
+
+def test_market_watch_stamp_is_skipped():
+    # Persistent-mode live-price stamps are model-facing only: neither the
+    # stamped form nor a bare marker content leaks into history events.
+    items = _sse(
+        [
+            HumanMessage(
+                content="<market-watch>\nNVDA  $233.45  +2.31% today\n</market-watch>",
+                id="market-watch-1",
+                additional_kwargs={"lc_source": "market_watch"},
+            ),
+            HumanMessage(
+                content="<market-watch>\nunstamped historical form\n</market-watch>",
+                id="market-watch-2",
+            ),
+            AIMessage(content="ok", id="ai-1"),
+        ]
+    )
+    assert [i["event"] for i in items] == ["message_chunk"]
+    assert items[0]["data"]["content"] == "ok"
+
+
+def test_runtime_update_row_is_hidden_and_opens_no_run():
+    """A durable row is a real message in history now, so the projector has to
+    recognize the writer's own stamp rather than a marker in the text."""
+    from ptc_agent.agent.middleware.runtime_context import (
+        DurableUpdate,
+        build_update_message,
+    )
+    from ptc_agent.agent.transcript.classify import is_run_boundary_message
+
+    row = build_update_message(
+        DurableUpdate(
+            kind="agent_md_changed",
+            schema_version=1,
+            text="+ a Thread Index section",
+            provenance={"source": "sandbox", "writer": "subagent:research"},
+        )
+    )
+    row.id = "runtime-update-1"
+
+    # It never surfaces as user input, in the main transcript or in a task one.
+    assert _sse([row, AIMessage(content="ok", id="ai-1")]) == _sse(
+        [AIMessage(content="ok", id="ai-1")]
+    )
+    assert _sse([row], agent="task:abc123") == []
+
+    # And it never opens a run: a run opened here would start mid-turn.
+    assert not is_run_boundary_message(row)
+    assert is_run_boundary_message(HumanMessage(content="what moved?", id="h-1"))
+
+
+def test_orchestrator_message_is_hidden_and_opens_no_run():
+    """The orchestrator's re-invoke trigger and task notices land mid-turn; read
+    as input, each opened a transcript turn of its own and became that turn's
+    request. Checkpoints from before the stamp carry only the message name."""
+    from ptc_agent.agent.transcript.classify import (
+        ORCHESTRATOR_SOURCE,
+        is_run_boundary_message,
+    )
+
+    stamped = HumanMessage(
+        content="User sent additional instructions.",
+        name="orchestrator",
+        additional_kwargs={"lc_source": ORCHESTRATOR_SOURCE},
+        id="orchestrator-1",
+    )
+    unstamped = HumanMessage(
+        content="User sent additional instructions.", name="orchestrator", id="orchestrator-2"
+    )
+    for message in (stamped, unstamped):
+        assert not is_run_boundary_message(message)
+        assert _sse([message], agent="task:abc123") == []
+    assert _sse([stamped, AIMessage(content="ok", id="ai-1")]) == _sse(
+        [AIMessage(content="ok", id="ai-1")]
+    )
+
+
+def test_empty_call_retry_hint_is_hidden_and_opens_no_run():
+    """The hint a retry sends lands mid-turn, between a broken answer and the
+    retried one; read as input it would show as a user message and open a run."""
+    from ptc_agent.agent.transcript.classify import (
+        EMPTY_CALL_RETRY_SOURCE,
+        is_run_boundary_message,
+    )
+
+    hint = HumanMessage(
+        content="Your previous response had stop_reason=tool_use",
+        additional_kwargs={"lc_source": EMPTY_CALL_RETRY_SOURCE},
+        id="hint-1",
+    )
+    assert not is_run_boundary_message(hint)
+    assert _sse([hint], agent="task:abc123") == []
+    assert _sse([hint, AIMessage(content="ok", id="ai-1")]) == _sse(
+        [AIMessage(content="ok", id="ai-1")]
+    )
+
+
+def test_stamped_steering_message_projects_delivered():
+    delivered = {
+        "count": 1,
+        "messages": [{"content": "focus on Q2", "user_id": "u-1", "timestamp": 1.0}],
+        "timestamp": 2.0,
+    }
+    items = _sse(
+        [
+            HumanMessage(
+                content="[Steering from User]\nfocus on Q2",
+                id="h-s",
+                additional_kwargs={
+                    "lc_source": "steering",
+                    "steering_delivered": delivered,
+                },
+            ),
+            AIMessage(content="ok", id="ai-1"),
+        ]
+    )
+    assert [i["event"] for i in items] == ["steering_delivered", "message_chunk"]
+    data = items[0]["data"]
+    assert data["thread_id"] == THREAD_ID
+    assert data["messages"] == delivered["messages"]
+    assert data["count"] == 1
+    # The raw steering text never leaks as assistant content.
+    assert items[1]["data"]["content"] == "ok"
+
+
+def test_unstamped_steering_marker_falls_back_to_content():
+    items = _sse(
+        [HumanMessage(content="[Steering from User]\nuse eurodollars", id="h-s")]
+    )
+    assert [i["event"] for i in items] == ["steering_delivered"]
+    assert items[0]["data"]["messages"] == [{"content": "use eurodollars"}]
+    assert items[0]["data"]["count"] == 1
+
+
+def test_unstamped_subagent_followup_falls_back_to_content():
+    items = _sse(
+        [
+            HumanMessage(
+                content="[Follow-up Instructions from Orchestrator]\nadd sources",
+                id="h-f",
+            )
+        ]
+    )
+    assert [i["event"] for i in items] == ["steering_delivered"]
+    assert items[0]["data"]["content"] == "add sources"
+    assert items[0]["data"]["count"] == 1
+
+
+def test_delivered_entries_keep_their_request_key_and_origin():
+    """The client settles its optimistic steer by ``request_key`` and labels
+    an agent's by ``origin``, so a replayed entry carries both as the live
+    one did."""
+    delivered = {
+        "count": 1,
+        "messages": [
+            {
+                "content": "do x",
+                "user_id": "u-1",
+                "timestamp": 1.0,
+                "origin": {"type": "agent", "agent": "chief_of_staff"},
+            },
+            {
+                "content": "stop that",
+                "user_id": "u-1",
+                "timestamp": 1.5,
+                "platform": "telegram",
+                "request_key": "rk-1",
+            },
+        ],
+        "timestamp": 2.0,
+    }
+    items = _sse(
+        [
+            HumanMessage(
+                content="[Steering from Chief of Staff]\ndo x",
+                id="h-s",
+                additional_kwargs={
+                    "lc_source": "steering",
+                    "steering_delivered": delivered,
+                },
+            )
+        ]
+    )
+
+    (item,) = items
+    assert item["event"] == "steering_delivered"
+    cos, user = item["data"]["messages"]
+    assert cos["origin"] == {"type": "agent", "agent": "chief_of_staff"}
+    assert user["request_key"] == "rk-1"
+    assert user["platform"] == "telegram"
+
+
+def test_a_resumed_task_run_opens_with_its_delivered_steers():
+    """A task resumed with steers its last run never read opens with them as
+    an unmarked input (it still opens a run); replay shows them delivered,
+    as the live stream did, not as a typed user message."""
+    delivered = {
+        "content": "add sources",
+        "count": 1,
+        "input_ids": ["in-1"],
+        "entries": [{"input_id": "in-1", "content": "add sources"}],
+    }
+    items = _sse(
+        [
+            HumanMessage(
+                content="add sources",
+                id="h-r",
+                additional_kwargs={"steering_delivered": delivered},
+            )
+        ],
+        agent="task:abc",
+    )
+
+    assert [i["event"] for i in items] == ["steering_delivered"]
+    assert items[0]["data"]["agent"] == "task:abc"
+    assert items[0]["data"]["input_ids"] == ["in-1"]
+
+
+def test_a_plain_task_input_still_projects_as_a_user_message():
+    items = _sse([HumanMessage(content="research X", id="h-t")], agent="task:abc")
+
+    assert [i["event"] for i in items] == ["user_message"]
+
+
+def test_summary_message_projects_summarize_complete():
+    from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+    from ptc_agent.agent.transcript import TranscriptTarget
+
+    message = build_summary_message(
+        "we discussed rates",
+        TranscriptTarget("abcd1234-0000-0000-0000-000000000000"),
+        original_message_count=40,
+    )
+    items = _sse([message])
+    assert [i["event"] for i in items] == ["context_window"]
+    data = items[0]["data"]
+    assert data["action"] == "summarize"
+    assert data["signal"] == "complete"
+    assert data["summary_text"] == "we discussed rates"
+    assert data["summary_length"] == len("we discussed rates")
+    assert data["original_message_count"] == 40
+
+
+def test_token_usage_projected_after_message_content():
+    items = _sse(
+        [
+            AIMessage(
+                content="answer",
+                id="ai-1",
+                usage_metadata={
+                    "input_tokens": 900,
+                    "output_tokens": 100,
+                    "total_tokens": 1000,
+                },
+            )
+        ]
+    )
+    assert [i["event"] for i in items] == ["message_chunk", "context_window"]
+    data = items[1]["data"]
+    assert data["action"] == "token_usage"
+    assert data["signal"] == "complete"
+    assert data["input_tokens"] == 900
+    assert data["output_tokens"] == 100
+    assert data["total_tokens"] == 1000
+    # Saved before the stamp: replay fills in the deployment default.
+    assert "threshold" not in data
+
+
+def test_token_usage_carries_the_threshold_its_call_ran_under():
+    # The turn's own preset, not the deployment default: the threshold is per
+    # turn and only the checkpoint outlives it.
+    from ptc_agent.agent.middleware.compaction.utils import stamp_context_threshold
+
+    message = AIMessage(
+        content="answer",
+        id="ai-1",
+        usage_metadata={"input_tokens": 900, "output_tokens": 100, "total_tokens": 1000},
+    )
+    stamp_context_threshold(message, 300000)
+    items = _sse([message])
+    assert items[1]["data"]["threshold"] == 300000
+
+
+def _compacted(message, summary_id, text="condensed", count=30):
+    """``message`` as the response to a call that compacted to ``summary_id``."""
+    from ptc_agent.agent.middleware.compaction.utils import stamp_compaction_summary
+
+    stamp_compaction_summary(
+        message,
+        summary_id,
+        {
+            "summary_length": len(text),
+            "original_message_count": count,
+            "summary_text": text,
+            "source": "model",
+        },
+    )
+    return message
+
+
+def test_a_compacted_calls_summary_replays_right_before_its_response():
+    # Live, the summarize signal fires before the compacted call streams, so
+    # it sits between that call and the one before it.
+    first = AIMessage(
+        content="before",
+        id="ai-1",
+        usage_metadata={"input_tokens": 900, "output_tokens": 100, "total_tokens": 1000},
+    )
+    second = _compacted(AIMessage(content="after", id="ai-2"), "sum-1")
+
+    items = _sse([first, second], agent="task:t1")
+
+    assert [(i["event"], i["data"].get("action")) for i in items] == [
+        ("message_chunk", None),
+        ("context_window", "token_usage"),
+        ("context_window", "summarize"),
+        ("message_chunk", None),
+    ]
+    assert items[2]["data"] == {
+        "thread_id": THREAD_ID,
+        "agent": "task:t1",
+        "action": "summarize",
+        "signal": "complete",
+        "summary_length": len("condensed"),
+        "summary_text": "condensed",
+        "original_message_count": 30,
+        "source": "model",
+    }
+
+
+def test_a_summary_replayed_inline_does_not_also_open_the_span():
+    from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+    from src.server.services.history.projector import context_signal_items
+    from src.server.services.history.slices import SpanDelta
+
+    summary = build_summary_message("condensed", None, original_message_count=30)
+    stamped = SpanDelta(
+        messages=[_compacted(AIMessage(content="after", id="ai-2"), summary.id)],
+        new_summarization_event={"summary_message": summary, "cutoff_index": 3},
+    )
+    # Saved before the stamp: the state diff is all there is.
+    unstamped = SpanDelta(
+        messages=[AIMessage(content="after", id="ai-2")],
+        new_summarization_event={"summary_message": summary, "cutoff_index": 3},
+    )
+
+    assert context_signal_items(THREAD_ID, stamped) == []
+    (item,) = context_signal_items(THREAD_ID, unstamped)
+    assert item["data"]["summary_text"] == "condensed"
+
+
+def test_workflow_run_items_whitelists_fields_and_sanitizes_errors():
+    # Driver frames carry raw `str(exc)`; replay must scrub them and drop
+    # anything the panel does not read, exactly as model_fallback does.
+    from types import SimpleNamespace
+
+    from src.server.services.history.projector import workflow_run_items
+
+    leaky = "HTTPError 401 from https://provider.example/v1?api_key=sk-0123456789abcdef"
+    history = SimpleNamespace(
+        new_ui_records=[
+            {
+                "name": "workflow_run",
+                "props": {
+                    "task_id": "wf1",
+                    "frames": [
+                        {
+                            "agent": "task:wf1",
+                            "phase": "child_done",
+                            "seq": 0,
+                            "status": "error",
+                            "error": leaky,
+                            "raw_stack": "/srv/app/driver.py line 42",
+                        },
+                    ],
+                },
+            }
+        ]
+    )
+    data = workflow_run_items(history, task_id="wf1")[0]["data"]
+    assert "sk-0123456789abcdef" not in data["error"]
+    assert "[REDACTED]" in data["error"]
+    assert "raw_stack" not in data
+
+
+def test_workflow_run_items_replays_every_field_the_emitter_declares():
+    # The whitelist is the emitter's own tuple, not a copy of it. Restating it
+    # here would put the live path and the replay path on two lists, and a name
+    # missing from this one renders live and blanks on refresh.
+    from types import SimpleNamespace
+
+    from ptc_agent.agent.middleware.background_subagent.workflow.emitter import (
+        WORKFLOW_FRAME_FIELDS,
+    )
+    from src.server.services.history.projector import workflow_run_items
+
+    frame = {name: f"value-{name}" for name in WORKFLOW_FRAME_FIELDS}
+    frame["off_the_whitelist"] = "dropped"
+    history = SimpleNamespace(
+        new_ui_records=[
+            {"name": "workflow_run", "props": {"task_id": "wf1", "frames": [frame]}}
+        ]
+    )
+
+    data = workflow_run_items(history, task_id="wf1")[0]["data"]
+    assert data == {name: f"value-{name}" for name in WORKFLOW_FRAME_FIELDS}
+
+
+def test_workflow_run_items_sanitizes_the_ledger_failure():
+    from types import SimpleNamespace
+
+    from src.server.services.history.projector import workflow_run_items
+
+    items = workflow_run_items(
+        SimpleNamespace(new_ui_records=[]),
+        task_id="wf1",
+        ledger_status="error",
+        ledger_failure="upstream refused: Authorization: Bearer abc.def.ghi",
+    )
+    assert (
+        items[0]["data"]["error"]
+        == "upstream refused: Authorization: Bearer [REDACTED]"
+    )
+
+
+def test_workflow_run_items_replays_every_frame_in_order():
+    from types import SimpleNamespace
+
+    from src.server.services.history.projector import workflow_run_items
+
+    frames = [
+        {"agent": "task:wf1", "phase": "run_started", "name": "n"},
+        {"agent": "task:wf1", "phase": "child_done", "seq": 0, "status": "ok"},
+        {"agent": "task:wf1", "phase": "run_completed", "status": "completed"},
+    ]
+    turn = SimpleNamespace(
+        new_ui_records=[
+            {"name": "image_capture", "props": {"path_to_url": {}}},
+            {"name": "workflow_run", "props": {"task_id": "wf1", "frames": frames}},
+        ]
+    )
+    items = workflow_run_items(turn)
+    assert [i["event"] for i in items] == ["workflow_lifecycle"] * 3
+    assert [i["data"] for i in items] == frames
+    # Verbatim copies, not aliases — downstream stamping must not mutate
+    # the checkpointed record.
+    assert all(i["data"] is not f for i, f in zip(items, frames))
+
+
+def test_workflow_run_items_skips_malformed_records():
+    from types import SimpleNamespace
+
+    from src.server.services.history.projector import workflow_run_items
+
+    turn = SimpleNamespace(
+        new_ui_records=[
+            {"name": "workflow_run", "props": {"frames": "not-a-list"}},
+            {"name": "workflow_run", "props": None},
+            {"name": "workflow_run", "props": {"frames": ["bare-string", {"phase": "log"}]}},
+        ]
+    )
+    items = workflow_run_items(turn)
+    assert [i["data"] for i in items] == [{"phase": "log"}]
+
+
+def test_workflow_run_items_ledger_overrides_contradicting_terminal():
+    # The driver snapshots run_completed BEFORE the terminal CAS, which can
+    # adopt a raced cancel intent — the ledger row is the status authority.
+    from types import SimpleNamespace
+
+    from src.server.services.history.projector import workflow_run_items
+
+    history = SimpleNamespace(
+        new_ui_records=[
+            {
+                "name": "workflow_run",
+                "props": {
+                    "task_id": "wf1",
+                    "frames": [
+                        {"agent": "task:wf1", "phase": "run_started"},
+                        {
+                            "agent": "task:wf1",
+                            "phase": "run_completed",
+                            "status": "completed",
+                            "error": None,
+                        },
+                    ],
+                },
+            }
+        ]
+    )
+    items = workflow_run_items(
+        history, task_id="wf1", ledger_status="cancelled"
+    )
+    assert [i["data"]["phase"] for i in items] == [
+        "run_started",
+        "run_completed",
+    ]
+    terminal = items[-1]["data"]
+    assert terminal["status"] == "cancelled"
+    # Agreeing ledger never rewrites, and an open ledger row never overrides.
+    agree = workflow_run_items(history, task_id="wf1", ledger_status="completed")
+    assert agree[-1]["data"]["status"] == "completed"
+    live = workflow_run_items(history, task_id="wf1", ledger_status="in_progress")
+    assert live[-1]["data"]["status"] == "completed"
+
+
+def test_workflow_run_items_synthesizes_terminal_when_snapshot_missing():
+    # A best-effort snapshot write can fail (or be refused by the namespace
+    # fence) while the terminal pipeline still archives the stream: replay
+    # then settles the panel from the ledger row instead of leaving it
+    # empty forever.
+    from types import SimpleNamespace
+
+    from src.server.services.history.projector import workflow_run_items
+
+    history = SimpleNamespace(new_ui_records=[])
+    items = workflow_run_items(
+        history,
+        task_id="wf1",
+        ledger_status="error",
+        ledger_failure="engine crashed",
+    )
+    assert len(items) == 1
+    data = items[0]["data"]
+    assert data["agent"] == "task:wf1"
+    assert data["phase"] == "run_completed"
+    assert data["status"] == "failed"
+    assert data["error"] == "engine crashed"
+
+    # A clean run carries no `error` key at all — the emitter drops a null
+    # error live and `_projected_run_frame` drops it on replay, so a synthesized
+    # frame that kept it would be the one shape of the three that disagrees.
+    clean = workflow_run_items(history, task_id="wf1", ledger_status="completed")
+    assert "error" not in clean[0]["data"]
+
+    # No synthesis while the run is open or the ledger row is absent.
+    assert workflow_run_items(history, task_id="wf1", ledger_status="in_progress") == []
+    assert workflow_run_items(history, task_id="wf1") == []
+
+
+def test_a_fallback_notice_sits_after_the_message_its_call_followed():
+    # Each model call tries the primary first, so a primary that stays down
+    # leaves one notice per call; live, each fired just before its call's
+    # output. A record from before notices named their message opens the turn.
+    from types import SimpleNamespace
+
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    from src.server.services.history.projector import (
+        history_events_to_sse,
+        messages_to_history_events,
+        with_model_fallbacks,
+    )
+
+    def fallback(n: int, after: str | None) -> dict:
+        record = {
+            "id": f"ui-{n}",
+            "name": "model_fallback",
+            "props": {"from_model": "primary", "to_model": f"backup-{n}"},
+        }
+        if after:
+            record["metadata"] = {"after_message_id": after}
+        return record
+
+    turn = SimpleNamespace(
+        messages=[
+            HumanMessage(content="go", id="h-1"),
+            AIMessage(
+                content="",
+                id="ai-1",
+                tool_calls=[{"name": "Bash", "args": {}, "id": "tc-1"}],
+            ),
+            ToolMessage(content="out", tool_call_id="tc-1", id="tm-1"),
+            AIMessage(content="done", id="ai-2"),
+        ],
+        new_ui_records=[
+            fallback(1, "h-1"),
+            fallback(2, "tm-1"),
+            fallback(3, None),
+            fallback(4, "elsewhere"),
+        ],
+    )
+
+    items = with_model_fallbacks(
+        "t-1",
+        turn,
+        lambda messages: history_events_to_sse(
+            messages_to_history_events(messages), thread_id="t-1"
+        ),
+    )
+
+    assert [
+        i["data"]["to_model"] if i["event"] == "model_fallback" else i["event"]
+        for i in items
+    ] == [
+        "backup-1",
+        "backup-3",
+        "backup-4",
+        "tool_calls",
+        "tool_call_result",
+        "backup-2",
+        "message_chunk",
+    ]
+
+
+def _file_op_events(tool_name, args):
+    call_args = {"file_path": "notes.md", **args}
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": tool_name, "args": call_args, "id": "tc-w"}],
+        ),
+        ToolMessage(content="ok", tool_call_id="tc-w", name=tool_name, id="tm-1"),
+    ]
+    return [i["event"] for i in _sse(msgs)]
+
+
+def test_a_write_or_edit_naming_another_computer_derives_no_artifact():
+    """The file is on that computer, so a card would open a path the turn's own
+    computer lacks."""
+    write = {"content": "x\n"}
+    edit = {"old_string": "a", "new_string": "b"}
+    assert "artifact" in _file_op_events("Write", write)
+    assert "artifact" in _file_op_events("Edit", edit)
+    assert "artifact" not in _file_op_events("Write", {**write, "computer": "Studio Mac"})
+    assert "artifact" not in _file_op_events("Edit", {**edit, "computer": "Studio Mac"})

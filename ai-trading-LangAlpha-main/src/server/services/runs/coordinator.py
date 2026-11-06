@@ -1,0 +1,805 @@
+"""Turn lifecycle v4 — RunCoordinator: the only code that transitions run state.
+
+START happens eagerly at the HTTP boundary (before the StreamingResponse /
+dispatch 202), so every accepted request has a durable in_progress attempt
+row before any execution begins. Finalize is one CAS transaction — response
+terminal + thread projection + usage + outbox — with post-commit transport
+effects afterward. Every terminal path (complete, interrupt, error, cancel,
+setup failure, abandoned generator) funnels through finalize_run; nothing
+else may write a run's terminal state.
+"""
+
+import asyncio
+import logging
+from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Coroutine, Dict, Optional
+from uuid import uuid4
+
+from src.server.database.runs import lifecycle as tl_db
+from src.server.database.runs.lifecycle import (  # re-exported for callers
+    AttemptConflictError,
+    DuplicateRequestError,
+    FinalizeResult,
+    ForkSpec,
+    NewestCheckpoint,
+    QuerySpec,
+    RunOutcome,
+    RunSlotBusyError,
+    StaleForkError,
+)
+from src.server.services.runs.pending_input import (
+    untaken_input_metadata,
+    untaken_input_stamp,
+)
+from src.server.utils.error_sanitization import sanitize_error_text
+
+__all__ = [
+    "RunCoordinator",
+    "RunHandle",
+    "RunOutcome",
+    "QuerySpec",
+    "ForkSpec",
+    "FinalizeResult",
+    "RunSlotBusyError",
+    "DuplicateRequestError",
+    "AttemptConflictError",
+    "StaleForkError",
+    "protected_finalize",
+]
+
+logger = logging.getLogger(__name__)
+
+# Strong refs for finalize tasks whose awaiter was cancelled out from under
+# them — the task must keep running detached until the terminal write lands.
+_protected_tasks: set = set()
+
+
+def _reap_protected(task: asyncio.Task) -> None:
+    _protected_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()  # marks the exception retrieved for detached tasks
+    if exc is not None:
+        logger.critical(
+            f"[RunCoordinator] protected finalize {task.get_name()} failed",
+            exc_info=exc,
+        )
+
+
+def _drop_protected(task: asyncio.Task) -> None:
+    _protected_tasks.discard(task)
+    if not task.cancelled():
+        task.exception()  # its awaiter reports it
+
+
+def spawn_protected(
+    coro: Coroutine, name: str, *, log_failure: bool = True
+) -> asyncio.Task:
+    """Run ``coro`` detached, strongly referenced until it finishes.
+
+    ``log_failure=False`` for a task that is always awaited, by its caller or
+    by a task that takes over when the caller is cancelled, so what it raises
+    is the awaiter's to handle, a routine refusal included.
+    """
+    task = asyncio.create_task(coro, name=name)
+    _protected_tasks.add(task)
+    task.add_done_callback(_reap_protected if log_failure else _drop_protected)
+    return task
+
+
+async def protected_finalize(coro: Coroutine, label: str):
+    """Run a finalize coroutine immune to the awaiting task's cancellation.
+
+    Pre-handoff finalization runs on the client-stream task; a disconnect
+    injects CancelledError mid-await, which would abort the terminal
+    transaction and leave the run with no owner. The coroutine runs in its
+    own strongly-referenced task: if the awaiter is cancelled, the
+    CancelledError still propagates to it, but the finalize completes
+    detached.
+    """
+    return await asyncio.shield(spawn_protected(coro, f"turn-finalize-{label}"))
+
+
+@dataclass
+class RunHandle:
+    """Identity of one run (= one conversation_responses row), START to finalize."""
+
+    run_id: str
+    thread_id: str
+    turn_index: int
+    attempt_no: int
+    workspace_id: Optional[str] = None
+    user_id: Optional[str] = None
+    is_byok: bool = False
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    finalized: bool = False
+    # Phase 2 (I2): the run's pinned PG session — advisory-lock fence,
+    # lifecycle SQL, and per-run saver on one connection. None = Phase-1
+    # fallback (memory saver, split app/checkpoint DBs, or pool not open).
+    guard: Optional[Any] = None
+    # The ``pending_input`` stamp a failure or a stop before the graph took
+    # this attempt's input records on its row; empty when /retry should replay.
+    pending_input: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def checkpointer(self) -> Optional[Any]:
+        """The saver this run's graph MUST use: the guard's session-bound
+        saver when fenced, else the global pooled saver."""
+        if self.guard is not None:
+            return self.guard.saver
+        from src.server.app import setup
+
+        return setup.checkpointer
+
+
+def _stamp_untaken_input(
+    handle: RunHandle, outcome: RunOutcome, newest: Optional[NewestCheckpoint]
+) -> RunOutcome:
+    """Record a failed or stopped attempt's input as pending when no step of
+    the thread is its run's (``untaken_input_stamp``). A stopped one has no
+    input on the branch either, so its regenerate sends the message again."""
+    if outcome.status not in ("error", "cancelled"):
+        return outcome
+    stamp = untaken_input_stamp(handle.pending_input, handle.run_id, newest)
+    if stamp:
+        outcome.metadata = {**stamp, **(outcome.metadata or {})}
+    return outcome
+
+
+def _with_detached_failure_kind(outcome: RunOutcome) -> RunOutcome:
+    """Stamp the kind a reload words a failed run with no owner by.
+
+    Its worker or its consumer died, a fault of this service's own, so the
+    row reads as ``internal`` and a reload shows no diagnostic, as the frame
+    sent live does. When the run framed its own failure before it died, a
+    reload replays that frame, so the row carries that frame's kind (none
+    for a time limit's) and the reload reads as the live stream did.
+    """
+    sent = outcome.record.error_frame if outcome.record else None
+    kind = sent.get("error_kind") if sent else "internal"
+    if kind:
+        outcome.metadata = {**(outcome.metadata or {}), "error_kind": kind}
+    return outcome
+
+
+class RunCoordinator:
+    """Stateless singleton — all run state lives in Postgres rows and RunHandles."""
+
+    _instance: Optional["RunCoordinator"] = None
+
+    @classmethod
+    def get_instance(cls) -> "RunCoordinator":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    # ------------------------------------------------------------------ START
+
+    async def start_run(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        request_key: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        is_byok: bool = False,
+        query: Optional[QuerySpec] = None,
+        fork: Optional[ForkSpec] = None,
+        run_horizon: Optional[int] = None,
+        turn_index: Optional[int] = None,
+        attempt_no: int = 1,
+        retry_of_run_id: Optional[str] = None,
+        run_metadata: Optional[Dict[str, Any]] = None,
+        pending_input: Optional[Dict[str, Any]] = None,
+        on_started: Optional[Callable[[RunHandle], None]] = None,
+        before_commit: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> RunHandle:
+        """Create the durable attempt: query row + in_progress run + projection.
+
+        Raises RunSlotBusyError (409 admission), DuplicateRequestError
+        (idempotent retransmit — reconnect to the existing run, guard
+        released first), AttemptConflictError, StaleForkError (409, the
+        fork's branch moved after validation, or a run started after the
+        ``run_horizon`` a HITL answer was read at), or WriterGuardUnavailable
+        (503 — pinned-session budget/lock bounded refusal). A server-minted
+        request_key is the legacy fallback only; callers should supply one
+        for dedup to mean anything.
+
+        ``on_started`` receives the run as soon as its row commits, before
+        the announcements: a failure or a cancel there still raises, and the
+        caller holds the run to settle, since no executor ever takes it.
+        ``before_commit`` runs inside the START transaction, on its connection,
+        once the row holds the thread's slot; raising there rolls the START back.
+        """
+        from src.server.services import writer_guard as wg
+
+        # START stamps the producer on the run and on its query row, so no
+        # caller names it: the full agent is the only one left.
+        metadata = {
+            "msg_type": "ptc",
+            **(run_metadata or {}),
+            **untaken_input_metadata(pending_input or {}),
+        }
+        if query is not None:
+            query = replace(
+                query, metadata={"msg_type": "ptc", **(query.metadata or {})}
+            )
+        # START-stamp identity onto the durable row: finalize/recovery paths
+        # build the user-feed event from row metadata alone, with no in-process
+        # context surviving a crash (user_id names the channel, workspace_id
+        # scopes the client-side list invalidation). Unconditional: the
+        # authenticated principal must never lose to a caller-supplied
+        # run_metadata key — that value names the publish channel.
+        if user_id:
+            metadata["user_id"] = user_id
+        if workspace_id:
+            metadata["workspace_id"] = workspace_id
+
+        guard = None
+        handle = None
+        if wg.guard_enabled():
+            guard = await wg.WriterGuard.acquire_root(
+                thread_id=thread_id, run_id=run_id
+            )
+        try:
+            async with (guard.mutex if guard is not None else nullcontext()):
+                row = await tl_db.start_run(
+                    run_id=run_id,
+                    thread_id=thread_id,
+                    request_key=request_key or str(uuid4()),
+                    turn_index=turn_index,
+                    attempt_no=attempt_no,
+                    retry_of_run_id=retry_of_run_id,
+                    query=query,
+                    fork=fork,
+                    run_horizon=run_horizon,
+                    metadata=metadata,
+                    user_id=user_id,
+                    before_commit=before_commit,
+                    conn=guard.conn if guard is not None else None,
+                )
+            handle = RunHandle(
+                run_id=run_id,
+                thread_id=thread_id,
+                turn_index=row["turn_index"],
+                attempt_no=row["attempt_no"],
+                workspace_id=workspace_id,
+                user_id=user_id,
+                is_byok=is_byok,
+                started_at=row["created_at"],
+                guard=guard,
+                pending_input=pending_input or {},
+            )
+            if guard is not None:
+                guard.bind_owner(handle)
+            if on_started is not None:
+                on_started(handle)
+            # Two independent post-commit announcements, in parallel:
+            # - control lane: an attached mux admits the main-lane channel
+            #   push-style. Unbounded — the mux has no root-run recovery scan
+            #   yet, so a lost announce is a real gap worth waiting out.
+            # - user feed: best-effort spinner hint; a miss degrades to a late
+            #   spinner via the feed's DB reconcile, never a stuck state
+            #   (unlike run_settled, which rides the outbox). Time-bounded, and
+            #   a timeout is swallowed HERE so it can't reach the guard-release
+            #   below and fail the turn over a hint.
+            from src.server.services.thread_control_stream import (
+                announce_run_started,
+            )
+            from src.server.services.thread_lifecycle_feed import (
+                publish_run_started,
+            )
+
+            async def _feed_hint_bounded() -> None:
+                try:
+                    await asyncio.wait_for(
+                        publish_run_started(
+                            user_id=metadata.get("user_id"),
+                            thread_id=thread_id,
+                            workspace_id=metadata.get("workspace_id"),
+                            run_id=run_id,
+                            run_seq=row.get("run_seq"),
+                        ),
+                        timeout=1.0,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "run_started feed hint timed out (thread=%s run=%s)",
+                        thread_id,
+                        run_id,
+                    )
+
+            await asyncio.gather(
+                announce_run_started(thread_id, run_id),
+                _feed_hint_bounded(),
+            )
+        except BaseException:
+            # Covers post-commit failures too (incl. CancelledError from the
+            # announce await): releasing the guard here is what lets the
+            # recovery scanner reclaim the committed in_progress row instead
+            # of it wedging the thread behind a leaked advisory lock.
+            if handle is not None:
+                # Before the await, which a cancel can cut short: whoever
+                # settles this run does it on the pool.
+                handle.guard = None
+            if guard is not None:
+                await guard.release()
+            raise
+        return handle
+
+    # --------------------------------------------------------------- FINALIZE
+
+    async def finalize_run(
+        self,
+        handle: RunHandle,
+        outcome: RunOutcome,
+        *,
+        post_commit: Optional[Callable[[], Awaitable[None]]] = None,
+        tail_drain: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> FinalizeResult:
+        """The single terminal transition. Idempotent: losing a finalize race
+        (cancel vs owner) returns applied=False and performs no writes.
+
+        Usage rows ride the same transaction — a billing persist failure
+        aborts the terminal write with it and surfaces, instead of being
+        swallowed into a zombie ACTIVE turn.
+
+        Owns the guard teardown: the finalize SQL runs on the pinned session
+        (a lost session downgrades the outcome — see ``_downgrade_if_guard_
+        lost``); afterwards N(root) drops so the next turn can start, and the
+        session is released — immediately, or after ``tail_drain`` when
+        background-subagent writers outlive the turn (their saver IS this
+        session).
+        """
+        # Finalize owns the guard from its first line, since every exit tears
+        # it down. Not later: the cycle collector clears the handle's weakref
+        # before an abandoned stream generator's death path gets here, and a
+        # settle can outlast the monitor's one tick of grace.
+        if handle.guard is not None:
+            handle.guard.bind_owner(None)
+        try:
+            newest_read = True
+            try:
+                newest = await self._newest_checkpoint(handle)
+            except Exception:
+                logger.warning(
+                    f"[RunCoordinator] checkpoint_id read failed for "
+                    f"{handle.thread_id}",
+                    exc_info=True,
+                )
+                newest, newest_read = None, False
+
+            # Outside the mutex: a checkpoint read and an outbox write, which
+            # need nothing of the guard's session.
+            from src.server.services.report_back.steer import (
+                confirm_checkpointed_holds,
+            )
+
+            await confirm_checkpointed_holds(handle.thread_id, handle.run_id)
+
+            usage_writer = None
+            if outcome.per_call_records or outcome.tool_usage:
+                usage_writer = self._build_usage_writer(handle, outcome)
+
+            if outcome.errors:
+                outcome.errors = [
+                    sanitize_error_text(e) if isinstance(e, str) else e
+                    for e in outcome.errors
+                ]
+
+            # ANY guard's mutex gates the CAS — including an already-lost
+            # one: a lost-but-open session's saver can still execute, and
+            # only its mutex serializes those ops against the pool CAS.
+            raw_guard = handle.guard
+            async with (raw_guard.mutex if raw_guard is not None else nullcontext()):
+                # The loss decision and the CAS must be atomic: the monitor
+                # sets `lost` while holding the guard mutex, so deciding
+                # HERE — inside the mutex — is race-free where a snapshot
+                # taken outside would be stale (monitor queued ahead of
+                # finalize).
+                guard = raw_guard
+                if guard is not None and not guard.usable:
+                    guard = None
+                outcome = self._downgrade_if_guard_lost(handle, outcome, guard)
+                if newest_read:
+                    outcome = _stamp_untaken_input(handle, outcome, newest)
+                result = await tl_db.finalize_run(
+                    run_id=handle.run_id,
+                    thread_id=handle.thread_id,
+                    outcome=outcome,
+                    newest=newest,
+                    usage_writer=usage_writer,
+                    conn=guard.conn if guard is not None else None,
+                )
+        except BaseException:
+            # A failed finalize leaves the row in_progress for recovery; the
+            # session must not stay pinned while nothing owns the run — and
+            # tail writers may still be live, so the session is discarded
+            # (closed), never clean-released out from under them.
+            self._teardown_guard(handle, tail_drain=None, discard=True)
+            raise
+        handle.finalized = True
+        self._teardown_guard(handle, tail_drain=tail_drain)
+
+        if result.applied:
+            if post_commit is not None:
+                try:
+                    await post_commit()
+                except Exception:
+                    logger.warning(
+                        f"[RunCoordinator] post_commit hook failed for "
+                        f"run={handle.run_id}",
+                        exc_info=True,
+                    )
+            self.post_finalize_tail(handle.thread_id, result.run)
+        return result
+
+    async def fail_open_run(
+        self,
+        handle: RunHandle,
+        error_message: str,
+        *,
+        status: str = "error",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[FinalizeResult]:
+        """Guarantee-finalize for paths that die between START and execution.
+
+        Phase 1 has no recovery scanner: any code path that STARTed a run and
+        cannot hand it to the executor MUST call this, or the slot leaks until
+        operator intervention. Death paths run on the client-stream task, so
+        the finalize is internally shielded (protected_finalize) — callers
+        never need to wrap it. Never raises, except propagating the caller's
+        own cancellation after the detached finalize is underway.
+        """
+        if handle.finalized:
+            return None
+        try:
+            return await protected_finalize(
+                self.finalize_run(
+                    handle,
+                    RunOutcome(
+                        status=status,
+                        metadata=metadata or {},
+                        errors=[error_message],
+                        execution_time=(
+                            datetime.now(timezone.utc) - handle.started_at
+                        ).total_seconds(),
+                    ),
+                ),
+                label=handle.run_id,
+            )
+        except Exception:
+            logger.error(
+                f"[RunCoordinator] fail_open_run could not finalize "
+                f"run={handle.run_id}; slot remains held",
+                exc_info=True,
+            )
+            return None
+
+    async def finalize_detached_run(
+        self,
+        thread_id: str,
+        run_id: str,
+        outcome: RunOutcome,
+        *,
+        newest: Optional[NewestCheckpoint] = None,
+        error_frame: Optional[Dict[str, Any]] = None,
+    ) -> FinalizeResult:
+        """The guard-less finalize funnel for runs with no live owner
+        (recovery scanner, dispatch reconcile): the same terminal CAS as the
+        owner path, then its entire tail — projection refresh + drainer nudge
+        on a won CAS, and terminal-frame emission through the run_end gate
+        even on a lost one (the survivor may have died between its commit and
+        its emission; the gate keeps the close exactly-once against a live
+        emitter). ``newest`` is the thread's newest checkpoint as the caller
+        read it, which the pointer moves to only when the run wrote it.
+        ``error_frame`` is the caller's client-facing failure
+        payload, emitted only when the verified terminal status is ``error``.
+        Raises like the CAS it wraps; callers that must never raise wrap it.
+        """
+        if outcome.status == "error":
+            outcome = _with_detached_failure_kind(outcome)
+        from src.server.services.report_back.steer import confirm_checkpointed_holds
+
+        await confirm_checkpointed_holds(thread_id, run_id)
+        result = await tl_db.finalize_run(
+            run_id=run_id,
+            thread_id=thread_id,
+            outcome=outcome,
+            newest=newest,
+        )
+        if result.applied:
+            self.post_finalize_tail(thread_id, result.run)
+        final_status = (result.run or {}).get("status")
+        if final_status:
+            from src.server.services.runs.executor import (
+                LocalRunExecutor,
+            )
+
+            await LocalRunExecutor.get_instance().append_run_end_event(
+                thread_id,
+                run_id,
+                final_status,
+                error_frame=error_frame if final_status == "error" else None,
+            )
+        return result
+
+    async def reconcile_orphaned_dispatch(
+        self,
+        thread_id: str,
+        run_id: str,
+        *,
+        error_text: Optional[str] = None,
+        label: str = "dispatch",
+    ) -> Optional[str]:
+        """Last-resort owner (I6) for a dispatched run whose consumer died
+        without the executor settling the row.
+
+        One funnel call: CAS a still-in_progress row to error (durable cancel
+        intent may adopt 'cancelled'), then close the transport with the
+        verified terminal status through the run_end gate. When nothing
+        durable can be established (row missing, CAS failure) an error frame
+        still tells attached clients the workflow died — without claiming a
+        terminal. Returns the verified terminal status, or None. Never raises.
+        """
+        error_frame = {
+            "thread_id": thread_id,
+            "content": "background turn failed",
+            "error_type": "background_failure",
+            "error": error_text or "background turn failed",
+            "error_kind": "internal",
+        }
+        newest, stamp = await self._detached_input_stamp(thread_id, run_id, label)
+        try:
+            result = await self.finalize_detached_run(
+                thread_id,
+                run_id,
+                RunOutcome(
+                    status="error",
+                    errors=[error_text or "background turn failed"],
+                    metadata={"recovery": "dispatch_consumer_crash", **stamp},
+                ),
+                newest=newest,
+                error_frame=error_frame,
+            )
+            return (result.run or {}).get("status")
+        except Exception:
+            logger.critical(
+                f"[{label}] last-resort finalize failed for run={run_id}; "
+                f"row (if any) remains in_progress for recovery",
+                exc_info=True,
+            )
+            try:
+                from src.server.services.runs.executor import (
+                    LocalRunExecutor,
+                )
+
+                await LocalRunExecutor.get_instance().append_run_end_event(
+                    thread_id, run_id, None, error_frame=error_frame
+                )
+            except Exception:
+                logger.warning(
+                    f"[{label}] failed to emit terminal error SSE for "
+                    f"thread_id={thread_id} run_id={run_id}",
+                    exc_info=True,
+                )
+            return None
+
+    async def _detached_input_stamp(
+        self, thread_id: str, run_id: str, label: str
+    ) -> tuple[Optional[NewestCheckpoint], Dict[str, Any]]:
+        """The thread's newest checkpoint and the input stamp for a run settled
+        with no handle, from the row START wrote, as the recovery scanner
+        settles one. Without them a retry replays the turn before this one,
+        or finds no checkpoint at all on a new thread. A failed read stamps
+        nothing and moves no pointer, as on the owner's path."""
+        from src.server.app import setup
+        from src.server.services.runs.pending_input import read_untaken_input
+        from src.server.utils.checkpoint_helpers import newest_checkpoint
+
+        try:
+            run = await tl_db.get_run(run_id)
+            saver = setup.checkpointer
+            newest = await newest_checkpoint(saver, thread_id) if saver else None
+        except Exception:
+            logger.warning(
+                f"[{label}] run or checkpoint read failed for run={run_id}; "
+                f"settling it unstamped",
+                exc_info=True,
+            )
+            return None, {}
+        return newest, untaken_input_stamp(read_untaken_input(run), run_id, newest)
+
+    # ------------------------------------------------------------ guard utils
+
+    def _downgrade_if_guard_lost(
+        self, handle: RunHandle, outcome: RunOutcome, usable_guard
+    ) -> RunOutcome:
+        """A run whose pinned session died cannot vouch for its final
+        checkpoints (the saver died with the session), so success statuses
+        are dishonest: downgrade completed/interrupted to error, exactly as
+        the recovery scanner would classify it. The finalize then runs on
+        the pool — same CAS, one winner — with the loss stamped.
+
+        ``usable_guard`` is the caller's guard view re-validated under the
+        guard mutex — the one the CAS will use — so the loss decision and
+        the CAS connection can never diverge."""
+        if handle.guard is None or usable_guard is not None:
+            return outcome
+        if outcome.status != "error":
+            # Even a requested 'cancelled' downgrades: without durable intent
+            # it would backfill cancel_requested_at and masquerade as a user
+            # stop, when the truth is an infra abort. Real user intent is on
+            # the row and the CAS adopts 'cancelled' from it regardless.
+            logger.critical(
+                f"[RunCoordinator] guard session lost for run={handle.run_id}; "
+                f"downgrading {outcome.status} -> error"
+            )
+            outcome.status = "error"
+            outcome.interrupt_reason = None
+            outcome.errors = (outcome.errors or []) + [
+                "guard_session_lost: the run's writer session died before "
+                "its final checkpoints could be verified"
+            ]
+        outcome.metadata = {**outcome.metadata, "guard_session_lost": True}
+        return outcome
+
+    def _teardown_guard(
+        self,
+        handle: RunHandle,
+        *,
+        tail_drain: Optional[Callable[[], Awaitable[None]]],
+        discard: bool = False,
+    ) -> None:
+        """Detached, exactly-once guard teardown: drop N(root) now so the
+        thread's next turn can start, hold the session through the tail
+        writers' drain, then unlock and return the connection.
+
+        A drain failure (registry error, deadline) means writers may still
+        be live, so it flips to ``discard``: a clean release would retarget
+        their saver at the pool and let them checkpoint unfenced — the
+        session is closed instead, and any late write fails loudly."""
+        guard = handle.guard
+        if guard is None:
+            return
+        handle.guard = None
+
+        async def _run() -> None:
+            must_discard = discard
+            try:
+                if tail_drain is not None and not must_discard:
+                    await guard.demote_to_tail()
+                    try:
+                        await tail_drain()
+                    except BaseException:
+                        must_discard = True
+                        logger.warning(
+                            f"[RunCoordinator] tail drain failed for "
+                            f"run={handle.run_id}; discarding the session",
+                            exc_info=True,
+                        )
+            finally:
+                await guard.release(discard=must_discard)
+
+        spawn_protected(_run(), f"writer-guard-teardown-{handle.run_id[:8]}")
+
+    # ------------------------------------------------------------------ utils
+
+    def _build_usage_writer(self, handle: RunHandle, outcome: RunOutcome):
+        async def _write(conn, final_status: str) -> None:
+            from src.server.services.persistence.usage import UsagePersistenceService
+
+            usage = UsagePersistenceService(
+                thread_id=handle.thread_id,
+                workspace_id=handle.workspace_id,
+                user_id=handle.user_id,
+            )
+            if outcome.per_call_records:
+                await usage.track_llm_usage(outcome.per_call_records)
+            if outcome.tool_usage:
+                usage.record_tool_usage_batch(outcome.tool_usage)
+            # final_status comes from the CAS row, not outcome.status: durable
+            # cancel intent may have overridden it.
+            ok = await usage.persist_usage(
+                response_id=handle.run_id,
+                deepthinking=outcome.metadata.get("deepthinking", False),
+                status=final_status,
+                conn=conn,
+                is_byok=outcome.metadata.get("is_byok", handle.is_byok),
+            )
+            if not ok:
+                # persist_usage swallows into False; inside the finalize txn
+                # that would commit a terminal row without its billing rows.
+                raise RuntimeError(
+                    f"usage persist failed for run={handle.run_id}; "
+                    f"aborting finalize transaction"
+                )
+
+        return _write
+
+    async def _newest_checkpoint(self, handle: RunHandle) -> Optional[NewestCheckpoint]:
+        """Checkpoint tip via the run's own session when fenced (reads its
+        own writes; a lock-lost session can't answer), else the pool saver."""
+        from src.server.utils.checkpoint_helpers import newest_checkpoint
+
+        guard = handle.guard
+        if guard is not None and guard.usable:
+            saver = guard.saver
+        else:
+            from src.server.app import setup
+
+            saver = setup.checkpointer
+        if not saver:
+            return None
+        return await newest_checkpoint(saver, handle.thread_id)
+
+    def post_finalize_tail(
+        self, thread_id: str, run: Optional[Dict[str, Any]]
+    ) -> None:
+        """The uniform after-a-won-CAS tail: every site that applies a
+        terminal transition schedules the replay refresh and the
+        transcript export and nudges the drainer, so they never drift apart
+        per call site. The export runs at every terminal status, since each
+        stamps the checkpoint and another thread may read this one's
+        transcript."""
+        self._schedule_replay_refresh(thread_id)
+        self._schedule_transcript_export(thread_id, run)
+        self._schedule_archive_prune(thread_id)
+        self._nudge_hook_drainer()
+
+    def _nudge_hook_drainer(self) -> None:
+        """Post-commit hint only — the drainer's poll is the delivery
+        guarantee, so a failed nudge is never an error."""
+        try:
+            from src.server.services.hook_outbox import HookOutboxDrainer
+
+            HookOutboxDrainer.get_instance().nudge()
+        except Exception:
+            logger.warning("[RunCoordinator] hook drainer nudge failed", exc_info=True)
+
+    def _schedule_replay_refresh(self, thread_id: str) -> None:
+        try:
+            from src.server.services.history.replay.refresh import (
+                schedule_replay_refresh,
+            )
+
+            schedule_replay_refresh(thread_id)
+        except Exception:
+            logger.warning(
+                f"[RunCoordinator] replay refresh scheduling failed for "
+                f"{thread_id}",
+                exc_info=True,
+            )
+
+    def _schedule_archive_prune(self, thread_id: str) -> None:
+        # An archived thread keeps its scratchpad while a run writes to it,
+        # and nothing else asks for the prune once that run ends.
+        try:
+            from src.server.services.workspace_manager import prune_if_archived_soon
+
+            prune_if_archived_soon(thread_id)
+        except Exception:
+            logger.warning(
+                f"[RunCoordinator] archive prune scheduling failed for {thread_id}",
+                exc_info=True,
+            )
+
+    def _schedule_transcript_export(
+        self, thread_id: str, run: Optional[Dict[str, Any]]
+    ) -> None:
+        # The workspace comes from the row's START stamp, which a detached
+        # finalize has without the run's process.
+        try:
+            meta = (run or {}).get("metadata") or {}
+            from src.server.services.transcripts import schedule_thread_export
+
+            schedule_thread_export(thread_id, meta.get("workspace_id"))
+        except Exception:
+            logger.warning(
+                f"[RunCoordinator] transcript export scheduling failed for "
+                f"{thread_id}",
+                exc_info=True,
+            )

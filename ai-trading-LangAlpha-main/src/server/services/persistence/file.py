@@ -1,0 +1,83 @@
+"""
+File Persistence Service.
+
+Keeps a workspace's manifest in step with the sandbox that holds the live
+files. The manifest is one Postgres row per path, with the bytes in object
+storage or, where there is none, in the row itself.
+
+- Snapshots the sandbox into the manifest on workspace stop/delete
+- Restores the manifest into a sandbox that was recreated
+- Serves file metadata and content from the manifest while the sandbox is down
+
+Each job has its own module: ``backup`` snapshots, ``restore`` restores,
+``blobs`` moves bytes into storage, ``resolve`` reads them back, and ``_rows``
+holds the row shape they share. This module is the facade over them.
+"""
+
+from typing import Any
+
+from src.server.database.workspace_file import (
+    get_file as db_get_file,
+    get_files_for_workspace,
+)
+from src.server.services.persistence import backup, restore
+from src.server.services.persistence.restore import (
+    RestoreGuardUnavailable as RestoreGuardUnavailable,
+    RestoreIdentityLost as RestoreIdentityLost,
+)
+from src.server.services.persistence.resolve import (
+    FileBytesUnavailable as FileBytesUnavailable,
+    resolve_file_bytes as resolve_file_bytes,
+    resolve_file_bytes_or_none as resolve_file_bytes_or_none,
+    resolve_file_text_or_none as resolve_file_text_or_none,
+)
+
+
+async def get_file_tree(workspace_id: str) -> list[dict[str, Any]]:
+    """
+    Get file metadata from DB for offline UI browsing.
+
+    Returns flat list of file metadata (no content).
+    """
+    files = await get_files_for_workspace(workspace_id, include_content=False)
+    return [
+        {
+            "path": f["file_path"],
+            "name": f["file_name"],
+            "size": f["file_size"],
+            "mime_type": f.get("mime_type"),
+            "is_binary": f.get("is_binary", False),
+            "modified_at": f.get("sandbox_modified_at"),
+        }
+        for f in files
+    ]
+
+
+async def get_file_content(
+    workspace_id: str, file_path: str
+) -> dict[str, Any] | None:
+    """
+    Get file content from DB for offline access.
+
+    Returns file record with content, or None if not found.
+    """
+    return await db_get_file(workspace_id, file_path, include_content=True)
+
+
+class FilePersistenceService:
+    """One name for the modules above, bound rather than re-typed.
+
+    Every entry point that touches the sandbox takes a ``WorkspaceLayout``
+    naming the project folder to mirror; see ``services.workspace_layout`` for
+    how a caller resolves one.
+    """
+
+    sync_to_db = staticmethod(backup.sync_to_db)
+    list_sandbox_files = staticmethod(backup.list_sandbox_files)
+    prior_from_meta = staticmethod(backup.prior_from_meta)
+    restore_to_sandbox = staticmethod(restore.restore_to_sandbox)
+    maybe_restore = staticmethod(restore.maybe_restore)
+    settle_restore_offer = staticmethod(restore.settle_restore_offer)
+    restore_deferred = staticmethod(restore.restore_deferred)
+    get_file_tree = staticmethod(get_file_tree)
+    get_file_content = staticmethod(get_file_content)

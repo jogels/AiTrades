@@ -1,0 +1,189 @@
+"""Event-ledger enumeration guard.
+
+The single-source-replay invariant: every SSE event type on the chat wire is
+exactly one of
+
+- **checkpoint-projected** — rebuilt from LangGraph checkpoint state,
+- **table-sourced** — rebuilt from an authoritative DB table,
+- **live-only** — transient signal never replayed (its durable content, if
+  any, reaches the client another way).
+
+A type with none of these sources is lost on replay; an older row's legacy
+facts only add to what these rebuild.
+
+This test scans the chat/replay emit surface for event-type literals and
+fails when an emitted type is missing from the ledger (add the type to the
+right category — which usually means implementing its replay source first)
+or when a ledger entry no longer appears in the source (delete it).
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+SRC = Path(__file__).resolve().parents[5] / "src"
+
+# The chat-wire emit surface. The workspace bring-up stream
+# (src/server/app/workspaces.py) is a separate SSE surface with its own
+# vocabulary and no replay, so it is deliberately out of scope.
+_SCAN_ROOTS = (
+    SRC / "server" / "handlers",
+    SRC / "server" / "services" / "history",
+    SRC / "server" / "services" / "runs",
+    SRC / "server" / "services" / "report_back",
+    SRC / "server" / "app" / "threads",
+)
+
+CHECKPOINT_PROJECTED = {
+    "message_chunk",
+    "tool_calls",
+    "tool_call_result",
+    "artifact",
+    "context_window",  # compaction state deltas; a manual compact or offload
+    # is the `context_window` ui record its own state write carries
+    "steering_delivered",  # the payload rides the injected steering
+    # message's additional_kwargs (request_key and origin included), and a
+    # resumed task run's opening input
+    "interrupt",
+    "model_fallback",  # ui-channel record pushed by ModelResilienceMiddleware;
+    # a stopped or failed run's last step never commits its own, which the
+    # response row's replay_facts keep (recovery rebuilds them from the
+    # frames of a run whose worker died)
+    "workflow_lifecycle",  # ui-channel `workflow_run` snapshot upserted by
+    # the workflow driver at terminal; frames re-emitted verbatim on replay
+}
+
+TABLE_SOURCED = {
+    "user_message",  # conversation_queries
+    "provenance",  # provenance_records
+    "credit_usage",  # conversation_usages
+    "error",  # conversation_responses.errors + metadata (terminal event)
+    "steering_returned",  # subagent_runs.replay_facts, written in the
+    # transaction that settles the task's outbox steers: undelivered steering
+    # has no checkpoint twin by design (nothing was injected into the graph);
+    # a run settled before those facts has it in its turn's legacy facts. The
+    # main thread's hands chat-app steers back to their gateway on the run's
+    # own stream, which resubmits them as its next turn; nothing replays it.
+}
+
+LIVE_ONLY = {
+    "metadata",  # per-run header
+    "workspace_status",  # sandbox bring-up progress
+    "turn_held",  # a send waiting behind a thread mutation, before admission
+    "warning",
+    "retry",  # recoverable-error notice, run restarts
+    "steering_accepted",  # only on the steering POST's own stream; the
+    # steer's durable twin is its steering_delivered or steering_returned
+    "model_retry",  # transient
+    "tool_call_chunks",  # replay's consolidated tool_calls carries full args
+    "compaction_chunk",  # summarize context_window carries summary_text
+    "subagent_stream_end",  # reconnect-stream sentinel
+    "stream_gap",  # reconnect trim notice (Last-Event-ID < stream head)
+    "run_end",  # post-CAS terminal frame closing the run stream (I6)
+    "replay_done",  # replay sentinel
+    "history_page",  # paged replay header: oldest turn sent, older remain
+    "snapshot",  # read-time cursors for the runs replay could not project;
+    # recomputed from ledger+Redis on every load, never replayed from a store
+    "market_watch_update",  # transient stamp notice; the durable watchlist
+    # re-seeds the chip via GET /{thread}/market-watch on replay
+    "thread_created",  # legacy creation SSE branch (POST /threads with
+    # Accept: text/event-stream), never on the run wire; the row itself is the
+    # durable truth (GET /threads/{id}). ⚠️ Deletes together with that branch.
+    "thread_title",  # legacy creation SSE branch: auto-title result; durable
+    # title re-read on every thread list/detail fetch, so never replayed.
+    # ⚠️ Deletes together with that branch (see create.py's shim note).
+    "chan_open",  # mux channel lifecycle (thread_stream_mux)
+    "chan_close",  # mux channel lifecycle (thread_stream_mux)
+    "transport_error",  # mux whole-socket retryable close
+    "timeout",  # watch/mux max-duration autoclose (predates mux; single-quoted emit sites evaded the scan)
+    "caught_up",  # backlog/live boundary marker on the run stream, emitted at
+    # the head sampled when a consumer attaches. Transient by construction: it
+    # marks where a batch of replayed events ends, so replaying it would be
+    # meaningless.
+    "chan_caught_up",  # the same boundary per mux channel (thread_stream_mux_v2)
+    "attached",  # mux: the attach served the open-turn drain a fresh page
+    # asked for; a socket-level acknowledgement, nothing to replay
+    "resync_required",  # mux: a channel's cursor fell off its stream, reload
+    # from history; a socket-level instruction, nothing to replay
+}
+
+_CATEGORIES = {
+    "checkpoint": CHECKPOINT_PROJECTED,
+    "table": TABLE_SOURCED,
+    "live-only": LIVE_ONLY,
+}
+
+_EMIT_PATTERNS = (
+    # _format_sse_event("type", ...) / _build_sse_event("type", ...), possibly
+    # line-wrapped
+    re.compile(r'_(?:format|build)_sse_event\(\s*"([a-z_]+)"'),
+    # _sse("type", ...) — the per-module frame helpers
+    re.compile(r'_sse\(\s*"([a-z_]+)"'),
+    # _control("type", ...) — the mux's socket-level control frames
+    re.compile(r'_control\(\s*"([a-z_]+)"'),
+    # yield f"event: type\n..." and plain "event: type"
+    re.compile(r'"(?:id: [^"]*?\\n)?event: ([a-z_]+)'),
+    # replay item dicts: {"event": "type", ...}
+    re.compile(r'\{"event": "([a-z_]+)"'),
+    re.compile(r'"event": "([a-z_]+)",'),
+    # NAME_EVENT_TYPE = "type": a wire type named by a constant, where the
+    # frame around it is assembled somewhere the patterns above cannot see.
+    re.compile(r'^_?[A-Z][A-Z0-9_]*_EVENT_TYPE\s*=\s*"([a-z_]+)"', re.M),
+)
+
+
+def _scan_files() -> list[Path]:
+    files: list[Path] = []
+    for root in _SCAN_ROOTS:
+        if root.is_file():
+            files.append(root)
+        else:
+            files.extend(sorted(root.rglob("*.py")))
+    return files
+
+
+def test_categories_are_disjoint_and_complete():
+    names = list(_CATEGORIES)
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            overlap = _CATEGORIES[a] & _CATEGORIES[b]
+            assert not overlap, f"{sorted(overlap)} in both {a!r} and {b!r}"
+
+
+def test_every_emitted_event_type_is_in_the_ledger():
+    ledger = set().union(*_CATEGORIES.values())
+    unclassified: dict[str, str] = {}
+    for path in _scan_files():
+        text = path.read_text()
+        for pattern in _EMIT_PATTERNS:
+            for event_type in pattern.findall(text):
+                if event_type not in ledger:
+                    unclassified.setdefault(event_type, str(path))
+    assert not unclassified, (
+        f"SSE event types emitted but not classified in the event ledger: "
+        f"{unclassified}. Add each to the category matching its replay "
+        f"source (implementing that source first if it does not exist)."
+    )
+
+
+def test_every_ledger_entry_still_exists_in_source():
+    corpus = "\n".join(p.read_text() for p in _scan_files())
+    stale = {
+        event_type
+        for event_type in set().union(*_CATEGORIES.values())
+        if f'"{event_type}"' not in corpus and f"event: {event_type}" not in corpus
+    }
+    assert not stale, (
+        f"Ledger entries with no emit site in the scanned sources: "
+        f"{sorted(stale)}. Remove them from the ledger."
+    )
+
+
+def test_stored_preferred_types_stay_in_the_replayable_set():
+    """A turn with legacy facts places these types from its facts in place of
+    its projected copies. Every other turn has only the projected copies, so
+    each type needs a replay source in the ledger."""
+    from src.server.services.history.replay.legacy import STORED_PREFERRED_EVENTS
+
+    assert set(STORED_PREFERRED_EVENTS) <= CHECKPOINT_PROJECTED | TABLE_SOURCED

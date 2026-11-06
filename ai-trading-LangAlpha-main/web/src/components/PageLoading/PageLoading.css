@@ -1,0 +1,194 @@
+/* Branded loading state — the research terminal warming up: a dim full-bleed
+ * quote wall with an ember scan band sweeping through it. Pure CSS; no
+ * canvas, no JS animation.
+ *
+ * The scan is two synchronized layers: a clipping window that travels down
+ * the component, and an ember copy of the wall inside it counter-translating
+ * by the same amount, so the lit text stays registered over the dim text.
+ * Both animate in cqh (the component is a size container), which keeps the
+ * sweep spanning the actual component height in both variants.
+ *
+ * The ember derives from the global accent token so the loader can never
+ * drift from the login surface's material when the palette moves. */
+
+.page-loading {
+  /* Dark-theme accents; light overrides below. */
+  --pl-ember: var(--color-accent-primary);
+  --pl-glow: color-mix(in srgb, var(--color-accent-primary) 35%, transparent);
+  --pl-wall-opacity: 0.14;
+
+  position: relative;
+  overflow: hidden;
+  /* The height must be explicit, not min-height-derived: under size
+   * containment a min-height-only container reports 0 to container units,
+   * which zeroes the scan geometry even though layout looks right. */
+  container-type: size;
+  height: 100vh;
+  height: 100svh;
+  background: var(--color-bg-page);
+  /* Appear only after 150ms so fast chunk loads never flash the loader.
+     motion-exempt: a debounce, not motion */
+  animation: pl-appear var(--motion-enter) var(--ease-out) 150ms backwards;
+}
+
+[data-theme='light'] .page-loading {
+  /* --pl-ember follows the accent token's own theme flip. */
+  --pl-glow: color-mix(in srgb, var(--color-accent-primary) 18%, transparent);
+  --pl-wall-opacity: 0.2;
+}
+
+.page-loading--pane {
+  /* Needs a definite-height parent (the app shell pane provides one); in a
+   * degenerate auto-height parent the wall and label still render at the
+   * min-height while the scan collapses away. */
+  height: 100%;
+  min-height: 240px;
+  background: transparent;
+}
+
+.page-loading__wall,
+.page-loading__scan-inner {
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+.page-loading__wall {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  opacity: var(--pl-wall-opacity);
+}
+
+.page-loading__scan {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 18cqh;
+  overflow: hidden;
+  transform: translateY(-18cqh);
+  /* motion-exempt: the scan's loop period, its own pace and not a UI duration */
+  animation: pl-scan 5.6s linear infinite;
+  -webkit-mask-image: linear-gradient(180deg, transparent, black 32% 68%, transparent);
+  mask-image: linear-gradient(180deg, transparent, black 32% 68%, transparent);
+}
+
+.page-loading__scan-inner {
+  color: var(--pl-ember);
+  opacity: 0.9;
+  text-shadow: 0 0 10px var(--pl-glow);
+  /* motion-exempt: shares the scan's period exactly, or the lit text drifts off-register */
+  animation: pl-scan-inner 5.6s linear infinite;
+}
+
+/* Older engines without container units get the still wall, no scan. */
+@supports not (height: 1cqh) {
+  .page-loading__scan {
+    display: none;
+  }
+}
+
+.page-loading__center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.page-loading__center > p {
+  /* A quiet pool behind the label so it stays legible mid-scan. */
+  padding: 7vh 9vw;
+  background: radial-gradient(closest-side, var(--color-bg-page) 30%, transparent);
+}
+
+.page-loading__label {
+  display: flex;
+  align-items: center;
+  margin: 0;
+  font-size: 0.8125rem;
+  letter-spacing: 0.05em;
+  color: var(--color-text-secondary);
+}
+
+/* The byte readout: every frame is one line of a strip, stepped up a line per
+ * tick behind a one-line window. A transform animation, so it keeps ticking
+ * while the main thread is busy starting the app. The line is a whole number
+ * of pixels at the default root size, so no frame sits on a fractional offset
+ * and blurs. */
+.page-loading__bytes {
+  --pl-line: 1.25rem;
+  --pl-tick: 150ms;
+  display: block;
+  height: var(--pl-line);
+  margin-right: 0.6em;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  line-height: var(--pl-line);
+  letter-spacing: 0;
+  white-space: pre;
+  color: var(--pl-ember);
+}
+
+.page-loading__bytes-strip {
+  display: block;
+  animation: pl-bytes calc(var(--pl-frames) * var(--pl-tick)) steps(var(--pl-frames)) infinite;
+}
+
+.page-loading__bytes-strip > span {
+  display: block;
+  height: var(--pl-line);
+}
+
+@keyframes pl-appear {
+  from {
+    opacity: 0;
+  }
+}
+
+/* The window travels the full component height while the copy inside
+ * counter-translates by the same linear amount — the two must share
+ * duration and timing exactly, or the lit text drifts off-register. */
+@keyframes pl-scan {
+  from {
+    transform: translateY(-18cqh);
+  }
+  to {
+    transform: translateY(100cqh);
+  }
+}
+
+@keyframes pl-scan-inner {
+  from {
+    transform: translateY(18cqh);
+  }
+  to {
+    transform: translateY(-100cqh);
+  }
+}
+
+@keyframes pl-bytes {
+  to {
+    transform: translateY(calc(var(--pl-frames) * var(--pl-line) * -1));
+  }
+}
+
+/* The readout holds its first byte; the label alone says the app is loading.
+   The appear delay is a debounce, not motion, so it outlasts the global rule
+   that cuts delays, and a fast chunk load still never flashes the loader. */
+@media (prefers-reduced-motion: reduce) {
+  .page-loading {
+    /* motion-exempt: a debounce, not motion */
+    animation-delay: 150ms !important;
+  }
+  .page-loading__scan {
+    display: none;
+  }
+  .page-loading__bytes-strip {
+    animation: none;
+  }
+}

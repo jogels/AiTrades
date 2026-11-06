@@ -1,0 +1,428 @@
+"""Integration tests for workspace CRUD operations against real PostgreSQL."""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+
+
+class TestCreateWorkspace:
+    """Test workspace creation."""
+
+    async def test_create_workspace_auto_id(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.workspace import create_workspace
+
+        ws = await create_workspace(
+            user_id=seed_user["user_id"],
+            name="Research",
+            description="Financial research workspace",
+        )
+
+        assert ws["name"] == "Research"
+        assert ws["description"] == "Financial research workspace"
+        assert ws["user_id"] == seed_user["user_id"]
+        assert ws["status"] == "creating"
+        assert ws["workspace_id"] is not None
+        assert ws["created_at"] is not None
+        assert ws["is_pinned"] is False
+        assert ws["sort_order"] == 0
+
+    async def test_create_workspace_explicit_id(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.workspace import create_workspace
+
+        explicit_id = str(uuid.uuid4())
+        ws = await create_workspace(
+            user_id=seed_user["user_id"],
+            name="Custom ID",
+            workspace_id=explicit_id,
+            status="running",
+        )
+
+        assert str(ws["workspace_id"]) == explicit_id
+        assert ws["status"] == "running"
+
+    async def test_create_workspace_with_config(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.workspace import create_workspace
+
+        config = {"model": "claude-sonnet", "tools": ["web_search"]}
+        ws = await create_workspace(
+            user_id=seed_user["user_id"],
+            name="Configured",
+            config=config,
+        )
+
+        assert ws["config"] == config
+
+
+class TestGetWorkspace:
+    """Test workspace retrieval."""
+
+    async def test_get_workspace_found(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        from src.server.database.workspace import get_workspace
+
+        ws = await get_workspace(str(seed_workspace["workspace_id"]))
+
+        assert ws is not None
+        assert ws["name"] == seed_workspace["name"]
+        assert ws["user_id"] == seed_workspace["user_id"]
+
+    async def test_get_workspace_not_found(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.workspace import get_workspace
+
+        result = await get_workspace(str(uuid.uuid4()))
+        assert result is None
+
+    async def test_get_workspace_excludes_deleted(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        from src.server.database.workspace import delete_workspace, get_workspace
+
+        ws_id = str(seed_workspace["workspace_id"])
+        await delete_workspace(ws_id)  # soft delete
+
+        result = await get_workspace(ws_id)
+        assert result is None
+
+
+class TestUpdateWorkspace:
+    """Test workspace updates."""
+
+    async def test_update_name_and_description(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        from src.server.database.workspace import update_workspace
+
+        ws_id = str(seed_workspace["workspace_id"])
+        updated = await update_workspace(
+            ws_id, name="Renamed", description="New desc"
+        )
+
+        assert updated is not None
+        assert updated["name"] == "Renamed"
+        assert updated["description"] == "New desc"
+
+    async def test_update_pin_status(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        from src.server.database.workspace import update_workspace
+
+        ws_id = str(seed_workspace["workspace_id"])
+        updated = await update_workspace(ws_id, is_pinned=True)
+
+        assert updated is not None
+        assert updated["is_pinned"] is True
+
+    async def test_a_rename_onto_a_taken_name_names_the_holder(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        from src.server.database.workspace import (
+            WorkspaceNameTaken,
+            create_workspace,
+            get_workspace,
+            update_workspace,
+        )
+
+        other = await create_workspace(
+            user_id=seed_workspace["user_id"], name="Research"
+        )
+        with pytest.raises(WorkspaceNameTaken) as caught:
+            await update_workspace(str(other["workspace_id"]), name="TEST workspace")
+
+        assert caught.value.workspace_id == str(seed_workspace["workspace_id"])
+        assert caught.value.name == "Test Workspace"
+        assert (await get_workspace(str(other["workspace_id"])))["name"] == "Research"
+
+    async def test_update_workspace_status(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        from src.server.database.workspace import update_workspace_status
+
+        ws_id = str(seed_workspace["workspace_id"])
+        updated = await update_workspace_status(ws_id, "stopped")
+
+        assert updated is not None
+        assert updated["status"] == "stopped"
+        assert updated["stopped_at"] is not None
+
+    async def test_update_workspace_status_leaves_the_binding_alone(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        """A status move must never rebind the workspace to a sandbox.
+
+        ``computers.provider_ref`` is the binding and ``workspaces.sandbox_id``
+        its shadow; ``try_bind_computer_provider_ref``'s compare-and-set is the
+        sole writer of both. If a plain status change could also write them, a
+        worker holding a superseded id could resurrect it.
+        """
+        from src.server.database.computer import (
+            create_computer,
+            get_computer,
+            try_bind_computer_provider_ref,
+        )
+        from src.server.database.workspace import (
+            bind_workspace_to_computer,
+            update_workspace_status,
+        )
+
+        ws_id = str(seed_workspace["workspace_id"])
+        computer = await create_computer(seed_workspace["user_id"], name="Cloud computer")
+        computer_id = str(computer["computer_id"])
+        assert await bind_workspace_to_computer(
+            ws_id, computer_id, expected_computer_id=None, dir_name="test-ws"
+        )
+        await try_bind_computer_provider_ref(
+            computer_id,
+            provider_ref="sandbox-abc-123",
+            expected_previous_provider_ref=None,
+            platform_secret_version=0,
+        )
+
+        updated = await update_workspace_status(ws_id, "running")
+
+        assert updated is not None
+        assert updated["status"] == "running"
+        assert updated["sandbox_id"] == "sandbox-abc-123"
+        machine = await get_computer(computer_id)
+        assert machine["provider_ref"] == "sandbox-abc-123"
+
+    async def test_update_workspace_status_cannot_revive_a_deleted_row(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        """Soft-deleted is terminal: nothing clears ``sandbox_id`` on delete, so a
+        revived row would hand its still-named sandbox back out."""
+        from src.server.database.workspace import (
+            delete_workspace,
+            update_workspace_status,
+        )
+
+        ws_id = str(seed_workspace["workspace_id"])
+        await delete_workspace(ws_id)
+
+        assert await update_workspace_status(ws_id, "running") is None
+
+    async def test_update_workspace_activity(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        from src.server.database.workspace import update_workspace_activity
+
+        ws_id = str(seed_workspace["workspace_id"])
+        updated = await update_workspace_activity(ws_id)
+
+        # update_workspace_activity returns bool (True if row was updated)
+        assert updated is True
+
+
+class TestDeleteWorkspace:
+    """Test workspace deletion."""
+
+    async def test_soft_delete(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        from src.server.database.workspace import delete_workspace, get_workspace
+
+        ws_id = str(seed_workspace["workspace_id"])
+        deleted = await delete_workspace(ws_id)
+        assert deleted is True
+
+        # Should not be found via normal get (filters out deleted)
+        result = await get_workspace(ws_id)
+        assert result is None
+
+    async def test_delete_nonexistent(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.workspace import delete_workspace
+
+        deleted = await delete_workspace(str(uuid.uuid4()))
+        assert deleted is False
+
+
+class TestListWorkspaces:
+    """Test workspace listing and pagination."""
+
+    async def test_get_workspaces_for_user(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.workspace import (
+            create_workspace,
+            get_workspaces_for_user,
+        )
+
+        # Create several workspaces
+        for i in range(3):
+            await create_workspace(
+                user_id=seed_user["user_id"],
+                name=f"Workspace {i}",
+                status="running",
+            )
+
+        workspaces, total = await get_workspaces_for_user(seed_user["user_id"])
+        assert total == 3
+        assert len(workspaces) == 3
+
+    async def test_pagination(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.workspace import (
+            create_workspace,
+            get_workspaces_for_user,
+        )
+
+        for i in range(5):
+            await create_workspace(
+                user_id=seed_user["user_id"],
+                name=f"Workspace {i}",
+                status="running",
+            )
+
+        workspaces, total = await get_workspaces_for_user(
+            seed_user["user_id"], limit=2, offset=0
+        )
+        assert total == 5
+        assert len(workspaces) == 2
+
+    async def test_excludes_an_unbound_home(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.workspace import (
+            create_workspace,
+            get_workspaces_for_user,
+        )
+
+        await create_workspace(
+            user_id=seed_user["user_id"],
+            name="Normal",
+            status="running",
+        )
+        await create_workspace(
+            user_id=seed_user["user_id"],
+            name="Home",
+            status="unbound",
+        )
+
+        workspaces, total = await get_workspaces_for_user(seed_user["user_id"])
+        assert total == 1
+        assert workspaces[0]["name"] == "Normal"
+
+
+class TestWorkspaceNames:
+    """Names by id of the user's live workspaces, for the channel settings."""
+
+    async def test_only_the_users_live_workspaces(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.user import create_user
+        from src.server.database.workspace import (
+            create_workspace,
+            delete_workspace,
+            get_workspace_names,
+        )
+
+        owner = seed_user["user_id"]
+        await create_user(user_id="someone-else", email="else@example.com")
+        beta = await create_workspace(user_id=owner, name="Beta", status="running")
+        alpha = await create_workspace(user_id=owner, name="Alpha", status="stopped")
+        await create_workspace(user_id=owner, name="Home", status="unbound")
+        gone = await create_workspace(user_id=owner, name="Gone", status="running")
+        await delete_workspace(str(gone["workspace_id"]))
+        await create_workspace(user_id="someone-else", name="Theirs", status="running")
+
+        names = await get_workspace_names(owner)
+
+        assert list(names.items()) == [
+            (str(alpha["workspace_id"]), "Alpha"),
+            (str(beta["workspace_id"]), "Beta"),
+        ]
+
+    async def test_home_bound_to_a_computer_stays_out(
+        self, seed_user, patched_get_db_connection, test_db_pool
+    ):
+        """Bound, Home takes its computer's status, so only its id still
+        marks it."""
+        from src.server.database.workspace import (
+            create_workspace,
+            get_or_create_home_workspace,
+            get_workspace_names,
+        )
+
+        owner = seed_user["user_id"]
+        home = str((await get_or_create_home_workspace(owner))["workspace_id"])
+        async with test_db_pool.connection() as conn:
+            await conn.execute(
+                "UPDATE workspaces SET status = 'running' WHERE workspace_id = %s",
+                (home,),
+            )
+        beta = await create_workspace(user_id=owner, name="Beta", status="running")
+
+        assert await get_workspace_names(owner) == {str(beta["workspace_id"]): "Beta"}
+        assert await get_workspace_names(owner, [home]) == {}
+
+    async def test_by_id_whatever_the_spelling(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.user import create_user
+        from src.server.database.workspace import (
+            create_workspace,
+            get_workspace_names,
+        )
+
+        owner = seed_user["user_id"]
+        await create_user(user_id="someone-else", email="else@example.com")
+        mine = await create_workspace(user_id=owner, name="Mine", status="running")
+        await create_workspace(user_id=owner, name="Other", status="running")
+        theirs = await create_workspace(
+            user_id="someone-else", name="Theirs", status="running"
+        )
+        mine_id = str(mine["workspace_id"])
+        theirs_id = str(theirs["workspace_id"])
+        asked = [mine_id.upper(), theirs_id, "not-a-uuid", str(uuid.uuid4())]
+
+        names = await get_workspace_names(owner, asked)
+
+        assert names == {mine_id: "Mine"}
+        assert await get_workspace_names(owner, ["not-a-uuid"]) == {}
+        assert await get_workspace_names(owner, []) == {}
+
+
+class TestBatchSortOrder:
+    """Test batch sort order updates."""
+
+    async def test_batch_update_sort_order(
+        self, seed_user, patched_get_db_connection
+    ):
+        from src.server.database.workspace import (
+            batch_update_sort_order,
+            create_workspace,
+            get_workspace,
+        )
+
+        ws1 = await create_workspace(
+            user_id=seed_user["user_id"], name="WS1", status="running"
+        )
+        ws2 = await create_workspace(
+            user_id=seed_user["user_id"], name="WS2", status="running"
+        )
+
+        items = [
+            (str(ws1["workspace_id"]), 10),
+            (str(ws2["workspace_id"]), 20),
+        ]
+        await batch_update_sort_order(seed_user["user_id"], items)
+
+        updated_ws1 = await get_workspace(str(ws1["workspace_id"]))
+        updated_ws2 = await get_workspace(str(ws2["workspace_id"]))
+        assert updated_ws1["sort_order"] == 10
+        assert updated_ws2["sort_order"] == 20

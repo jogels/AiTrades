@@ -1,0 +1,279 @@
+/**
+ * Live-stream interrupt projection: renders the HITL card for an `interrupt`
+ * SSE event onto the streaming assistant bubble and arms the pending-interrupt
+ * state. Stream-lifecycle effects (loading flag, ownership release) stay with
+ * the router; history replay has its own projection in fromHistoryEvent.
+ */
+
+import type { AssistantMessage } from '@/types/chat';
+import { updateMessage } from '../../hooks/utils/messageHelpers';
+import { setCardStatus } from './buckets';
+import { buildCreditPauseState } from './creditPauseCard';
+import { isToolApprovalInterrupt, toolApprovalCards } from './toolApprovalCard';
+import type { SSEEvent, StreamProcessorRefs } from '../types';
+import type { StreamRuntime } from '../runtime';
+
+export function projectLiveInterrupt(
+  rt: StreamRuntime,
+  event: SSEEvent,
+  assistantMessageId: string,
+  refs: StreamProcessorRefs,
+): void {
+  const actionRequests = event.action_requests || [];
+  const actionType = actionRequests[0]?.type as string | undefined;
+
+  // A still-pending interrupt re-raised after a HITL resume streams into a
+  // fresh `assistant-hitl-*` bubble with the same interrupt_id. Suppress the
+  // duplicate CARD (the segment push) while keeping the map write + pending
+  // tracking below, so the original card stays answerable and the resume's
+  // pending set (cleared at resume start) still re-tracks it.
+  const interruptAlreadyRendered = event.interrupt_id
+    ? rt.renderedInterruptIdsRef.current.has(event.interrupt_id)
+    : false;
+  if (event.interrupt_id) rt.renderedInterruptIdsRef.current.add(event.interrupt_id);
+  // Every branch below MUST push its card segment through this helper so
+  // the re-raise suppression can't be forgotten on a future interrupt type.
+  const appendCardSegment = (
+    segs: AssistantMessage['contentSegments'] | undefined,
+    seg: AssistantMessage['contentSegments'][number],
+  ): AssistantMessage['contentSegments'] =>
+    interruptAlreadyRendered ? (segs || []) : [...(segs || []), seg];
+
+  if (actionType === 'ask_user_question') {
+    // --- User question interrupt ---
+    const questionId = event.interrupt_id || `question-${Date.now()}`;
+    const questionData = actionRequests[0];
+    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+
+    rt.setMessages((prev) =>
+      updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+        ...msg,
+        contentSegments: appendCardSegment(msg.contentSegments, { type: 'user_question', questionId, order }),
+        userQuestions: {
+          ...(msg.userQuestions || {}),
+          [questionId]: {
+            question: questionData.question,
+            options: questionData.options || [],
+            allow_multiple: questionData.allow_multiple || false,
+            interruptId: event.interrupt_id,
+            status: 'pending',
+            answer: null,
+          },
+        },
+        isStreaming: false,
+      }; })
+    );
+
+    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
+    rt.setPendingInterrupt({
+      type: 'ask_user_question',
+      interruptId: event.interrupt_id,
+      assistantMessageId,
+      questionId,
+    });
+  } else if (actionType === 'create_workspace') {
+    // --- Create workspace interrupt ---
+    const proposalId = event.interrupt_id || `workspace-${Date.now()}`;
+    const proposalData = actionRequests[0];
+    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+
+    rt.setMessages((prev) =>
+      updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+        ...msg,
+        contentSegments: appendCardSegment(msg.contentSegments, { type: 'create_workspace', proposalId, order }),
+        workspaceProposals: {
+          ...(msg.workspaceProposals || {}),
+          [proposalId]: {
+            workspace_name: proposalData.workspace_name,
+            workspace_description: proposalData.workspace_description,
+            interruptId: event.interrupt_id,
+            status: 'pending',
+          },
+        },
+        isStreaming: false,
+      }; })
+    );
+
+    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
+    rt.setPendingInterrupt({
+      type: 'create_workspace',
+      interruptId: event.interrupt_id,
+      assistantMessageId,
+      proposalId,
+    });
+  } else if (actionType === 'start_question') {
+    // --- Start question interrupt ---
+    const proposalId = event.interrupt_id || `question-start-${Date.now()}`;
+    const proposalData = actionRequests[0];
+    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+
+    rt.setMessages((prev) =>
+      updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+        ...msg,
+        contentSegments: appendCardSegment(msg.contentSegments, { type: 'start_question', proposalId, order }),
+        questionProposals: {
+          ...(msg.questionProposals || {}),
+          [proposalId]: {
+            workspace_id: proposalData.workspace_id,
+            question: proposalData.question,
+            interruptId: event.interrupt_id,
+            status: 'pending',
+          },
+        },
+        isStreaming: false,
+      }; })
+    );
+
+    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
+    rt.setPendingInterrupt({
+      type: 'start_question',
+      interruptId: event.interrupt_id,
+      assistantMessageId,
+      proposalId,
+    });
+  } else if (actionType === 'ptc_agent') {
+    // --- PTC agent interrupt ---
+    const proposalId = event.interrupt_id || `ptc-agent-${Date.now()}`;
+    const proposalData = actionRequests[0];
+    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+
+    rt.setMessages((prev) =>
+      updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+        ...msg,
+        contentSegments: appendCardSegment(msg.contentSegments, { type: 'ptc_agent' as const, proposalId, order }),
+        ptcAgentProposals: {
+          ...(msg.ptcAgentProposals || {}),
+          [proposalId]: {
+            workspace_id: proposalData.workspace_id,
+            workspace_name: proposalData.workspace_name,
+            question: proposalData.question ?? '',
+            report_back: proposalData.report_back ?? true,
+            interruptId: event.interrupt_id,
+            // Persist tool_call_id ON the proposal so the clicked card
+            // self-identifies for backfill — never read from
+            // `pendingInterrupt`, which N parallel dispatches overwrite.
+            tool_call_id: proposalData.tool_call_id,
+            status: 'pending',
+          },
+        },
+        isStreaming: false,
+      }; })
+    );
+
+    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
+    rt.setPendingInterrupt({
+      type: 'ptc_agent',
+      interruptId: event.interrupt_id,
+      assistantMessageId,
+      proposalId,
+      toolCallId: proposalData.tool_call_id,
+    });
+  } else if (actionType === 'delete_workspace' || actionType === 'stop_workspace' || actionType === 'delete_thread') {
+    // --- Secretary action interrupt ---
+    const proposalId = event.interrupt_id || `secretary-${actionType}-${Date.now()}`;
+    const proposalData = actionRequests[0];
+    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+
+    rt.setMessages((prev) =>
+      updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+        ...msg,
+        contentSegments: appendCardSegment(msg.contentSegments, { type: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread', proposalId, order }),
+        secretaryActionProposals: {
+          ...(msg.secretaryActionProposals || {}),
+          [proposalId]: {
+            actionType: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread',
+            workspace_id: proposalData.workspace_id,
+            workspace_name: proposalData.workspace_name,
+            thread_id: proposalData.thread_id,
+            interruptId: event.interrupt_id,
+            status: 'pending',
+          },
+        },
+        isStreaming: false,
+      }; })
+    );
+
+    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
+    rt.setPendingInterrupt({
+      type: actionType,
+      interruptId: event.interrupt_id,
+      assistantMessageId,
+      proposalId,
+    });
+  } else if (actionType === 'credit_pause') {
+    // --- Credit pause interrupt ---
+    const proposalId = event.interrupt_id!;
+    const pauseState = buildCreditPauseState(actionRequests[0], event.interrupt_id!);
+    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+
+    // A re-raise is the pause saying it was never consumed, whatever the resume
+    // looked like from the client: admission opens a run either way, so the card
+    // was already flipped to `resumed`. Put that card back rather than writing a
+    // pending entry onto this bubble, which the suppression above leaves with no
+    // segment to render it — the pause would otherwise sit unanswerable, and the
+    // status is what history replays.
+    rt.setMessages((prev) =>
+      interruptAlreadyRendered
+        ? setCardStatus(prev, 'creditPauses', proposalId, 'pending')
+        : updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+            ...msg,
+            contentSegments: appendCardSegment(msg.contentSegments, { type: 'credit_pause', proposalId, order }),
+            creditPauses: { ...(msg.creditPauses || {}), [proposalId]: pauseState },
+            isStreaming: false,
+          }; })
+    );
+
+    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
+    rt.setPendingInterrupt({
+      type: 'credit_pause',
+      interruptId: event.interrupt_id,
+      assistantMessageId,
+      proposalId,
+    });
+  } else if (isToolApprovalInterrupt(event.kind, actionRequests[0])) {
+    // --- Direct MCP tool approval interrupt ---
+    const cards = toolApprovalCards(
+      actionRequests,
+      event.interrupt_id,
+      `tool-approval-${Date.now()}`,
+    );
+    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+
+    // A re-raise is the backend saying the calls are still stopped, whatever
+    // the resume looked like from the client, and the click already settled
+    // the cards to approved/rejected. Put them back rather than writing fresh
+    // entries onto this bubble, which the suppression above leaves with no
+    // segment to render them: the calls would otherwise sit unanswerable, and
+    // the status is what history replays.
+    rt.setMessages((prev) =>
+      interruptAlreadyRendered
+        ? cards.reduce((msgs, card) => setCardStatus(msgs, 'toolApprovals', card.proposalId, 'pending'), prev)
+        : updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+            ...msg,
+            contentSegments: cards.reduce(
+              (segments, card, i) =>
+                appendCardSegment(segments, { type: 'tool_approval', proposalId: card.proposalId, order: order + i }),
+              msg.contentSegments,
+            ),
+            toolApprovals: {
+              ...(msg.toolApprovals || {}),
+              ...Object.fromEntries(cards.map((c) => [c.proposalId, c.state])),
+            },
+            isStreaming: false,
+          }; })
+    );
+
+    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
+    rt.setPendingInterrupt({
+      type: 'tool_approval',
+      interruptId: event.interrupt_id,
+      assistantMessageId,
+      proposalId: cards[0].proposalId,
+    });
+  }
+  // Any other interrupt gets no card and no pending state. The only one left
+  // in the wild is a SubmitPlan review on a thread paused before the agent
+  // stopped raising it, and nothing can resume it now: arming it would hold the
+  // composer shut behind a card with no answer, while leaving it lets the next
+  // message start a fresh turn.
+}

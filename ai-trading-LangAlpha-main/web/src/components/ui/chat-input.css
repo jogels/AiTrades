@@ -1,0 +1,577 @@
+/* ====== ChatInput — mention pills ====== */
+
+.mention-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+/* The row stays mounted so its last pill can fade out; once that has gone it
+   takes no room, and no gap in the column. */
+.mention-pills:empty {
+  display: none;
+}
+
+.mention-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background-color: var(--color-accent-soft);
+  color: var(--color-text-primary);
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  line-height: 1.4;
+  max-width: 200px;
+}
+
+.mention-pill span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-pill-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: none;
+  border: none;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  transition: color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
+}
+
+.mention-pill-remove:hover {
+  color: var(--color-text-primary);
+  background-color: var(--color-border-muted);
+}
+
+/* ====== Snippet pill variant ====== */
+
+.mention-pill-snippet {
+  border: 1px dashed var(--color-accent-overlay);
+  background-color: var(--color-accent-soft);
+}
+
+/* ====== Slash command pill variant ====== */
+
+.mention-pill-slash {
+  border: 1px solid var(--color-slash-pill-border);
+  background-color: var(--color-slash-pill-bg);
+}
+
+.mention-pill-slash .mention-pill-icon {
+  color: var(--color-slash-icon);
+}
+
+.slash-cmd-icon {
+  color: var(--color-slash-icon);
+}
+
+/* ====== Slash command autocomplete description ====== */
+
+.mention-autocomplete-item .slash-cmd-name {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--color-text-primary);
+  white-space: nowrap;
+}
+
+.mention-autocomplete-item .slash-cmd-desc {
+  font-size: 0.6875rem;
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+/* ====== Autocomplete dropdown ====== */
+
+.mention-autocomplete {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  margin-bottom: 4px;
+  background-color: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-muted);
+  border-radius: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+  z-index: 100;
+  box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.4);
+  /* It opens above the composer, so it grows out of the composer's edge. */
+  transform-origin: bottom center;
+}
+
+.mention-autocomplete-empty {
+  padding: 12px 14px;
+  font-size: 0.8125rem;
+  color: var(--color-text-tertiary);
+}
+
+.mention-autocomplete-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background-color var(--motion-quick) var(--ease-out);
+}
+
+.mention-autocomplete-item:hover,
+.mention-autocomplete-item.active {
+  background-color: var(--color-accent-soft);
+}
+
+.mention-autocomplete-item .file-name {
+  font-size: 0.8125rem;
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-autocomplete-item .file-path {
+  font-size: 0.6875rem;
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+/* ====== Model selector trigger (Radix data-state) ====== */
+
+.model-selector-trigger {
+  color: var(--color-text-muted, #8b8fa3);
+}
+
+/* Open reads as the hover held, not as a selection: the pill names a
+   setting, and an accent fill and edge made it look like the active control. */
+.model-selector-trigger:hover:not(:disabled),
+.model-selector-trigger[data-state=open] {
+  background: var(--color-border-muted);
+}
+
+.model-selector-trigger[data-state=open] {
+  color: var(--color-text-primary);
+}
+
+/* ====== Send / stop button (quiet ink) ====== */
+
+/* One button for both, so a turn starting or ending changes its face in place
+ * (the `press` utility fades the fill) rather than swapping the control under
+ * the pointer. Stop wears the send button's face — the square glyph alone says
+ * stop. Red is reserved for hover intent so a running stream never shows an
+ * alarm slab. */
+.send-button {
+  background-color: var(--color-btn-primary-bg);
+  color: var(--color-btn-primary-text);
+}
+
+.send-button[data-mode='send']:disabled {
+  background-color: var(--color-bg-elevated);
+  color: var(--color-text-quaternary);
+}
+
+.send-button[data-mode='stop']:hover:not(:disabled) {
+  background-color: var(--color-btn-stop-hover-bg);
+  color: var(--color-btn-stop-hover-fg);
+}
+
+.send-button[data-mode='stop']:disabled {
+  opacity: 0.7;
+}
+
+/* ====== Voice Input (Mic) ====== */
+
+/* The pulse, the overlay's breathing and the waveform are the live
+   "listening" state, not decoration: they run only while the microphone is
+   open, and the reduced-motion block in animations.css stills them. */
+.mic-button.recording {
+  background-color: var(--color-btn-danger) !important;
+  color: white !important;
+  /* motion-exempt: a live listening state; the pulse's period is its own */
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes mic-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+  }
+
+  70% {
+    box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+  }
+}
+
+/* ====== Recording State for Container ====== */
+
+/* The composer's edge changes only for recording: its red edge and glow come
+ * in over quick and go over exit. Focus leaves the edge neutral. The caret
+ * already says where typing goes, and an accent edge would compete with the
+ * menus its pills open against it. */
+.chat-input-container {
+  position: relative;
+  transition:
+    border-color var(--motion-exit) var(--ease-out),
+    box-shadow var(--motion-exit) var(--ease-out);
+}
+
+.chat-input-container.recording {
+  transition-duration: var(--motion-quick);
+}
+
+.chat-input-container.recording {
+  border-color: var(--color-btn-danger) !important;
+  background: var(--color-bg-card);
+  box-shadow: 0 0 20px rgba(239, 68, 68, 0.1);
+}
+
+.recording-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(to right, rgba(239, 68, 68, 0.05), transparent 20%, transparent 80%, rgba(239, 68, 68, 0.05));
+  pointer-events: none;
+  z-index: 5;
+  border-radius: 22px;
+  /* motion-exempt: a live listening state; the overlay breathes on its own period */
+  animation: overlay-pulse 2s ease-in-out infinite;
+}
+
+@keyframes overlay-pulse {
+
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.voice-status-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+  z-index: 10;
+  color: var(--color-text-muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  opacity: 0.8;
+}
+
+.waveform {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+}
+
+.waveform-bar {
+  width: 3px;
+  height: 100%;
+  background-color: var(--color-btn-danger);
+  border-radius: 3px;
+  /* motion-exempt: a live listening state; the wave's period, and each bar
+     (`--bar`, set where they render) a step behind the last, are its shape */
+  animation: waveform-anim 1.2s ease-in-out calc(var(--bar, 0) * 0.1s) infinite;
+}
+
+@keyframes waveform-anim {
+
+  0%,
+  100% {
+    height: 4px;
+  }
+
+  50% {
+    height: 100%;
+  }
+}
+/* === WIDGET CONTEXT DECK === */
+.widget-deck-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 2px 6px;
+  border-bottom: 1px dashed var(--color-border-muted, rgba(20, 20, 23, 0.08));
+  margin-bottom: 4px;
+}
+
+.widget-deck-eyebrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 4px;
+  font-family: var(--font-mono);
+  font-size: 0.5938rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-accent-primary, #b88a2c);
+}
+
+.widget-deck-eyebrow-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.widget-deck-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--color-accent-primary, #b88a2c);
+  flex-shrink: 0;
+}
+
+.widget-deck-hint {
+  text-transform: none;
+  letter-spacing: 0;
+  font-style: italic;
+  font-size: 0.6875rem;
+  margin-left: 6px;
+  opacity: 0.85;
+}
+
+.widget-deck-eyebrow-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.widget-deck-clear {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  font-size: 0.5938rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-text-tertiary, #8a8a8a);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.widget-deck-clear:hover {
+  color: var(--color-icon-danger);
+}
+
+/* Show-less pill — appears left of Clear when the deck is fanned. Pill
+ * shape mirrors Apple's stack-collapse affordance: rounded background,
+ * sentence-case label, sits inline with the uppercase eyebrow row. */
+.widget-deck-show-less {
+  appearance: none;
+  border: 1px solid var(--color-border-muted, rgba(20, 20, 23, 0.08));
+  background: var(--color-bg-card, rgba(255, 255, 255, 0.6));
+  font: inherit;
+  font-size: 0.6875rem;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--color-text-secondary, #4a4a4a);
+  cursor: pointer;
+  padding: 2px 10px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  transition:
+    background var(--motion-quick) var(--ease-out),
+    color var(--motion-quick) var(--ease-out),
+    border-color var(--motion-quick) var(--ease-out);
+}
+
+.widget-deck-show-less:hover {
+  color: var(--color-text-primary, #1a1a1c);
+  border-color: var(--color-border-default, rgba(20, 20, 23, 0.16));
+}
+
+.widget-deck-stack {
+  position: relative;
+  transition: height var(--motion-fold) var(--ease-out);
+}
+
+.widget-deck-card {
+  position: absolute;
+  /* The whole offset rides `transform`, which is what the transition below
+     animates; a card moved by `top` would jump to its fanned slot. */
+  top: 0;
+  left: 0;
+  right: 0;
+  display: grid;
+  grid-template-columns: 32px 1fr 24px;
+  align-items: center;
+  gap: 10px;
+  background: var(--color-bg-card, #ffffff);
+  border: 1px solid var(--color-border-muted, rgba(20, 20, 23, 0.08));
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 1px 2px rgba(20, 20, 23, 0.04);
+  transition:
+    transform var(--motion-fold) var(--ease-out),
+    opacity var(--motion-fold) var(--ease-out),
+    box-shadow var(--motion-quick) var(--ease-out);
+  animation: widgetDeckCardIn var(--motion-enter) var(--ease-out);
+}
+
+@keyframes widgetDeckCardIn {
+  from { opacity: 0; transform: translateY(-6px) scale(0.96); }
+}
+
+.widget-deck-stack.fanned .widget-deck-card {
+  box-shadow: 0 4px 12px rgba(20, 20, 23, 0.06), 0 1px 2px rgba(20, 20, 23, 0.04);
+}
+
+.widget-deck-card-thumb {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: var(--color-accent-soft);
+  color: var(--color-accent-primary);
+  overflow: hidden;
+}
+
+.widget-deck-card-thumb.has-image {
+  background: linear-gradient(180deg, #1d1d1f 0%, #2a2a2e 100%);
+  position: relative;
+}
+
+.widget-deck-card-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.widget-deck-card-text {
+  min-width: 0;
+}
+
+.widget-deck-card-title {
+  font-weight: 500;
+  font-size: 0.8125rem;
+  line-height: 1.2;
+  color: var(--color-text-primary, #1a1a1c);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.widget-deck-card-snippet {
+  font-size: 0.6875rem;
+  color: var(--color-text-tertiary, #8a8a8a);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 2px;
+  letter-spacing: 0.01em;
+}
+
+.widget-deck-card-remove {
+  width: 24px;
+  height: 24px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-tertiary, #8a8a8a);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  padding: 0;
+  opacity: 0;
+  transition:
+    opacity var(--motion-quick) var(--ease-out),
+    background var(--motion-quick) var(--ease-out),
+    color var(--motion-quick) var(--ease-out);
+}
+
+.widget-deck-card-remove:hover {
+  color: var(--color-icon-danger);
+  background: var(--color-loss-soft);
+}
+
+/* Top card always shows its remove button. Fan-out reveals all of them. */
+.widget-deck-stack:not(.fanned) .widget-deck-card[data-i="0"] .widget-deck-card-remove,
+.widget-deck-stack.fanned .widget-deck-card-remove {
+  opacity: 1;
+}
+
+.widget-deck-fan-hint {
+  position: absolute;
+  top: -2px;
+  right: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--color-text-tertiary, #8a8a8a);
+  pointer-events: none;
+  opacity: 0.6;
+  z-index: 100;
+  transition: opacity var(--motion-quick) var(--ease-out);
+}
+
+.widget-deck-stack.fanned .widget-deck-fan-hint {
+  opacity: 0;
+}
+
+/* ====== ChatInput — subagents glyph ======
+   Turning on sends an agent out of the core to each seat, one after another;
+   turning off brings them back together. The offsets are set per node. */
+
+.subagents-glyph {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.subagents-glyph-node {
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: translate(var(--dx), var(--dy)) scale(0.2);
+  opacity: 0;
+  transition:
+    transform var(--motion-fold) var(--ease-out),
+    opacity var(--motion-exit) var(--ease-out);
+}
+
+/* Going out takes longer than coming back, and each agent leaves a stagger
+   after the one before (`--seat`, set per node). */
+.subagents-glyph[data-on='true'] .subagents-glyph-node {
+  transform: none;
+  opacity: 1;
+  transition-duration: var(--motion-enter), var(--motion-quick);
+  transition-delay: calc(var(--motion-stagger) * var(--seat, 0));
+}

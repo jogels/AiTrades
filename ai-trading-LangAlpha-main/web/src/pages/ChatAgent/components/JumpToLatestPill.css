@@ -1,0 +1,81 @@
+.jump-to-latest-pill {
+  position: absolute;
+  bottom: calc(var(--composer-h, 0px) + 16px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  /* Compact icon circle; --count widens it to fit the new-message number. */
+  height: 36px;
+  min-width: 36px;
+  padding: 0;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border-elevated);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: var(--color-text-primary);
+  cursor: pointer;
+  /* Theme-aware token (strong on the dark default, soft on light) — a hardcoded
+     near-black shadow was invisible against the dark theme's near-black bg. */
+  box-shadow: var(--shadow-card);
+  /* `bottom` follows the composer's height, which drops by a whole row when
+     the tray folds into it as this pill appears. */
+  transition:
+    bottom var(--motion-fold) var(--ease-out),
+    opacity var(--motion-enter) var(--ease-out),
+    transform var(--motion-enter) var(--ease-out),
+    background-color var(--motion-quick) var(--ease-out),
+    border-color var(--motion-quick) var(--ease-out),
+    visibility 0s;
+}
+
+/* Leaving: a shorter fade back down, and hidden only once it has finished. */
+.jump-to-latest-pill[data-state='closed'] {
+  opacity: 0;
+  transform: translateX(-50%) translateY(8px);
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    bottom var(--motion-fold) var(--ease-out),
+    opacity var(--motion-exit) var(--ease-out),
+    transform var(--motion-exit) var(--ease-out),
+    visibility 0s linear var(--motion-exit);
+}
+
+.jump-to-latest-pill--count {
+  padding: 0 12px;
+}
+
+/* Touch targets keep the 44px comfort size (WCAG 2.5.5). */
+@media (pointer: coarse) {
+  .jump-to-latest-pill {
+    height: 44px;
+    min-width: 44px;
+  }
+}
+
+/* A neutral hover, as on the other floating controls: the accent is kept for
+   what is live or the reader's own. */
+.jump-to-latest-pill:hover {
+  background: var(--color-bg-elevated);
+  border-color: var(--color-border-strong);
+}
+
+.jump-to-latest-pill__count {
+  /* Text-primary (not accent): the amber accent fails AA contrast on the
+     light theme's white pill; bold tabular text-primary is legible in both
+     themes. */
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jump-to-latest-pill,
+  .jump-to-latest-pill[data-state='closed'] {
+    transition: none;
+  }
+}

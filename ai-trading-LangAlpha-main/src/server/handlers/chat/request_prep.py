@@ -1,0 +1,932 @@
+"""Chat request preparation for the PTC run generator.
+
+Everything that turns a raw ``ChatRequest`` into a runnable graph invocation:
+message normalization, HITL response translation, fork/timezone resolution,
+skill contexts, steering setup, thread bootstrap, and graph config assembly.
+The START entry and retransmit dedup live in ``services.runs.admission``;
+error classification and the terminal error funnel live in
+``error_handling``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import partial
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+
+
+from ptc_agent.agent.limits import UNBOUNDED_RECURSION_LIMIT
+from ptc_agent.agent.middleware.provenance.command_trace import REPORT_COMMAND_KEY
+from ptc_agent.agent.middleware.runtime_context import TurnContext, parse_surface
+from src.config.settings import (
+    get_langsmith_metadata,
+    get_langsmith_tags,
+    get_locale_config,
+)
+from src.observability.langsmith_tracer import with_run_tracer
+from src.server.contracts.turn_kinds import (
+    ANNOUNCED_KEYS,
+    NOTIFICATION_QUERY_TYPES,
+    WAKE_QUERY_TYPE,
+)
+from src.server.database import conversation as qr_db
+from src.server.database.conversation.threads_write import remember_thread_llm_model
+from src.server.services.llm.thread_model import NamedModel
+from src.server.database.runs import lifecycle as tl_db
+from src.server.models.chat import CommandReport, summarize_hitl_response_map
+from src.server.utils.skill_context import (
+    detect_slash_commands,
+    parse_skill_contexts,
+)
+from src.utils.timezone_utils import zone_or_none
+from src.utils.tracking import TokenTrackingManager
+from src.tools.decorators import ToolUsageTracker
+
+if TYPE_CHECKING:
+    from src.server.models.chat import ChatRequest
+    from src.server.services.runs.coordinator import ForkSpec
+
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+# Hard-coded logger name for backward-compat with existing log routing.
+logger = logging.getLogger("src.server.handlers.chat_handler")
+
+# Yielded exactly once by a dispatched workflow generator immediately after
+# its START txn commits (v4 2.4c). The dispatch handler primes the generator
+# to this marker before returning its 200 JSON response, making that response
+# a durable receipt — the primer consumes it, so it never enters the SSE
+# stream.
+DISPATCH_STARTED_MARKER = "__dispatch_run_started__"
+
+
+@dataclass(frozen=True)
+class HandOffSteered:
+    """Yielded instead when a dispatched hand-off met a running turn and went
+    into it as a steer: no run of its own starts, and the primer answers with
+    ``run_id``, the run it was sent into, and ``steer_id``, the steer's row,
+    which names a later run that takes it in if that one ends first."""
+
+    run_id: str
+    steer_id: str
+
+
+# ---------------------------------------------------------------------------
+# Private helpers (moved as-is from original chat_handler.py)
+# ---------------------------------------------------------------------------
+
+
+def _append_to_last_user_message(messages: list[dict], text: str) -> None:
+    """Append text to the last user message in a message list (mutates in-place)."""
+    if not messages:
+        return
+    last_msg = messages[-1]
+    if not isinstance(last_msg, dict) or last_msg.get("role") != "user":
+        return
+    content = last_msg.get("content")
+    if isinstance(content, str):
+        last_msg["content"] = content + text
+    elif isinstance(content, list):
+        last_msg["content"].append({"type": "text", "text": text})
+
+
+def inject_inline_reminders(
+    messages: Optional[list[dict]],
+    reminders: list[Optional[str]],
+) -> None:
+    """Append each present reminder to the last user message, in order.
+
+    Falsy reminders are skipped. No-op when ``messages`` is falsy — callers pass
+    ``None`` on HITL-resume / checkpoint-replay turns, where the appended list
+    is discarded downstream.
+    """
+    if not messages:
+        return
+    for reminder in reminders:
+        if reminder:
+            _append_to_last_user_message(messages, reminder)
+
+
+def _first_zone(*candidates: Optional[str]) -> Optional[str]:
+    """The first candidate that names a zone; one that names none is logged
+    and skipped."""
+    for candidate in candidates:
+        if zone_or_none(candidate) is not None:
+            return candidate
+        if candidate:
+            logger.warning(f"Invalid timezone '{candidate}', trying the next source.")
+    return None
+
+
+def _resolve_fork(
+    *, request: ChatRequest, thread_id: str
+) -> tuple[str, Optional[ForkSpec]]:
+    """Compute query_type and the fork cleanup spec (truncation + checkpoint
+    pin).
+
+    The cleanup itself executes INSIDE the START transaction (v4 2.4,
+    ``start_run(fork=...)``): truncation, checkpoint pin, and the new attempt
+    commit or roll back together, so a slot conflict or a duplicate
+    retransmit can no longer leave a half-truncated thread behind — and the
+    MAX+1 turn allocation still sees the post-fork row set.
+    """
+    from src.server.services.runs.coordinator import ForkSpec
+
+    is_checkpoint_replay = bool(request.checkpoint_id and not request.messages)
+    if request.query_type:
+        query_type = request.query_type
+    elif request.hitl_response:
+        query_type = "resume_feedback"
+    elif is_checkpoint_replay:
+        query_type = "regenerate"
+    else:
+        query_type = "initial"
+
+    fork = None
+    if request.fork_from_turn is not None and request.checkpoint_id:
+        from src.server.utils.checkpoint_helpers import (
+            FORK_ROOT_CHECKPOINT_ID,
+            checkpoint_on_branch,
+            write_fork_root,
+        )
+
+        fork = ForkSpec(
+            from_turn=request.fork_from_turn,
+            checkpoint_id=request.checkpoint_id,
+            branch_tip=request.fork_branch_tip,
+            preserve_query_at_fork=is_checkpoint_replay,
+            run_horizon=request.fork_run_horizon,
+            # The walk stops at the tip the fork was read off: the checkpoint
+            # is on that tip's branch, so a pointer above the tip still has it.
+            on_branch=(
+                partial(checkpoint_on_branch, thread_id, request.fork_branch_tip)
+                if request.fork_branch_tip
+                else None
+            ),
+            write_root=(
+                partial(write_fork_root, thread_id)
+                if request.checkpoint_id == FORK_ROOT_CHECKPOINT_ID
+                else None
+            ),
+        )
+
+    return query_type, fork
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreparedHitl:
+    """A HITL resume turn's stored answer: how it is filed, and what it says.
+
+    ``metadata`` is ready to merge into the turn's query metadata, so the two
+    run handlers file an answer the same way rather than each re-packing the
+    same keys.
+    """
+
+    feedback_action: str
+    query_content: str
+    metadata: dict[str, Any]
+
+
+def process_hitl_response(request: ChatRequest) -> PreparedHitl:
+    """Extract HITL answer metadata for persistence.
+
+    ``metadata`` carries ``hitl_interrupt_ids`` always, plus ``hitl_answers``,
+    ``hitl_decisions`` and ``order_decisions`` when there are any.
+
+    One interrupt can stop several calls and be answered with a different
+    verdict for each, which ``hitl_answers`` collapses into a single key.
+    ``hitl_decisions`` keeps every decision under its own slot so slot i is the
+    answer to action request i, and it carries the user's own reject message
+    rather than the wording the agent is handed on resume. ``order_decisions``
+    is the same record for an order interrupt, keyed by attempt id instead of
+    by slot, so a stored verdict names the order it answered rather than a
+    position in a list that can change.
+    """
+    from src.server.models.chat import HITLResponse
+
+    # The wire type is ``Dict[str, HITLResponse]``, but a caller that built the
+    # request itself can hand over the plain dicts the client sent. Normalized
+    # once here, so everything below reads one shape.
+    responses = {
+        interrupt_id: (
+            response
+            if isinstance(response, HITLResponse)
+            else HITLResponse.model_validate(response)
+        )
+        for interrupt_id, response in request.hitl_response.items()
+    }
+    summary = summarize_hitl_response_map(responses)
+    feedback_action = summary["feedback_action"]
+
+    hitl_answers: dict = {}
+    hitl_decisions: dict = {}
+    order_decisions: dict = {}
+    for interrupt_id, response in responses.items():
+        recorded: list[dict] = []
+        for d in response.decisions:
+            recorded.append({"type": d.type, "message": d.message or None})
+            if d.type == "approve" and d.message:
+                hitl_answers[interrupt_id] = d.message
+            elif d.type == "reject" and not d.message:
+                hitl_answers[interrupt_id] = None
+        if recorded:
+            hitl_decisions[interrupt_id] = recorded
+
+        for attempt_id, verdict in (response.order_decisions or {}).items():
+            order_decisions[str(attempt_id)] = {
+                "type": verdict.type,
+                "message": verdict.message or None,
+            }
+
+    if hitl_answers:
+        has_answers = any(v is not None for v in hitl_answers.values())
+        feedback_action = (
+            "QUESTION_ANSWERED" if has_answers else "QUESTION_SKIPPED"
+        )
+
+    metadata: dict[str, Any] = {"hitl_interrupt_ids": summary["interrupt_ids"]}
+    for key, value in (
+        ("hitl_answers", hitl_answers),
+        ("hitl_decisions", hitl_decisions),
+        ("order_decisions", order_decisions),
+    ):
+        if value:
+            metadata[key] = value
+    return PreparedHitl(feedback_action, summary["content"], metadata)
+
+
+def provenance_metadata(request: ChatRequest) -> dict[str, Any]:
+    """Where a turn came from, for its query row (display only).
+
+    History labels a message from these keys, and none of them reaches the
+    model: ``origin`` is per turn, mirroring the thread-level
+    metadata['origin'] (threads go mixed: a pinned automation thread also
+    takes manual user follow-ups, which carry no origin); ``platform`` is the
+    raw surface string, the client deciding which values it labels, and the
+    request's own rather than :func:`turn_surface`'s, which gives a
+    report-back the thread's channel although nobody sent it from there; and
+    the ``ANNOUNCED_KEYS`` name what a notification turn announces, since its
+    own message is model-facing and hidden: ``report_source`` a report-back's
+    report, ``market_target`` and ``wakeup`` a wake's notices.
+    """
+    metadata: dict[str, Any] = {}
+    if request.origin:
+        metadata["origin"] = request.origin.model_dump(exclude_none=True)
+    if request.platform:
+        metadata["platform"] = request.platform
+    for key in ANNOUNCED_KEYS:
+        value = getattr(request, key)
+        if value and not isinstance(value, dict):
+            value = value.model_dump(exclude_none=True)
+        if value:
+            metadata[key] = value
+    return metadata
+
+
+def serialize_context_metadata(
+    request: ChatRequest,
+    query_metadata: dict,
+    user_input: str,
+    extra_commands: dict[str, str] | None = None,
+    allowed_skills: set[str] | None = None,
+) -> None:
+    """Serialize additional_context into lightweight persistence metadata.
+
+    Handles two cases:
+    1. ``request.additional_context`` is present — serialize ``skills`` and
+       ``directive`` entries (skip heavy multimodal data).
+    2. Fallback — detect slash commands from ``user_input`` text when no
+       context was provided by the frontend.
+
+    Mutates *query_metadata* in-place.
+    """
+    if request.additional_context:
+        serialized_ctx = []
+        for ctx in request.additional_context:
+            ctx_type = getattr(ctx, "type", None)
+            if ctx_type == "skills":
+                serialized_ctx.append({"type": "skills", "name": ctx.name})
+            elif ctx_type == "directive":
+                serialized_ctx.append({"type": "directive", "content": ctx.content})
+        if serialized_ctx:
+            query_metadata["additional_context"] = serialized_ctx
+
+    # Detect slash commands from message text when additional_context is absent
+    if not request.hitl_response and "additional_context" not in query_metadata:
+        _, early_detected = detect_slash_commands(
+            user_input,
+            extra_commands=extra_commands,
+            allowed_skills=allowed_skills,
+        )
+        if early_detected:
+            query_metadata["additional_context"] = [
+                {"type": "skills", "name": s.name} for s in early_detected
+            ]
+
+
+def normalize_request_messages(request: ChatRequest) -> list[dict]:
+    """Convert ``request.messages`` to ``{"id", "role", "content"}`` dicts.
+
+    Handles both plain-string and multi-part (text / image_url) content items.
+    The id is minted here rather than left to langgraph at write time because
+    the turn's input checkpoint keeps the input as sent, and a regenerate runs
+    that input again: an id it carries comes back as the same message, which
+    the reducer merges, while one minted per run is a second copy.
+    """
+    messages: list[dict] = []
+    for msg in request.messages:
+        if isinstance(msg.content, str):
+            messages.append(
+                {"id": str(uuid.uuid4()), "role": msg.role, "content": msg.content}
+            )
+        elif isinstance(msg.content, list):
+            content_items = []
+            for item in msg.content:
+                if hasattr(item, "type"):
+                    if item.type == "text" and item.text:
+                        content_items.append({"type": "text", "text": item.text})
+                    elif item.type == "image" and item.image_url:
+                        content_items.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": item.image_url},
+                            }
+                        )
+            messages.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "role": msg.role,
+                    "content": content_items or str(msg.content),
+                }
+            )
+    return messages
+
+
+def init_tracking(thread_id: str) -> tuple[TokenTrackingManager, ToolUsageTracker]:
+    """Initialise token + tool tracking for a workflow.
+
+    Returns ``(token_callback, tool_tracker)``.
+    """
+    token_callback = TokenTrackingManager.initialize_tracking(
+        thread_id=thread_id, track_tokens=True
+    )
+    tool_tracker = ToolUsageTracker(thread_id=thread_id)
+    return token_callback, tool_tracker
+
+
+class PriorThread(NamedTuple):
+    """The thread row as it stood before this turn stamped it.
+
+    Every field is absent on a thread's first turn, and on any turn whose read
+    failed: they are context for the turn rather than correctness, so a read
+    failure degrades to nothing rather than failing the turn start.
+    """
+
+    last_turn_at: Optional[datetime] = None
+    # The surface the thread is bound to (the one it was created on, or a
+    # channel identity stamped onto it later). Stands in for the turn's own
+    # surface on a notification, which arrives without one (``turn_surface``).
+    platform: Optional[str] = None
+    # The surface the latest attempt recorded it ran on (``surface_stamp``).
+    # Stands in for a resume's, which continues that attempt.
+    attempt_platform: Optional[str] = None
+
+
+def _fork_predecessor_turn(request: ChatRequest) -> Optional[int]:
+    """The turn a fork discards from, when this request is one (``_resolve_fork``)."""
+    if request.fork_from_turn is not None and request.checkpoint_id:
+        return request.fork_from_turn
+    return None
+
+
+async def _read_prior_thread(
+    thread_id: str, *, before_turn: Optional[int] = None
+) -> PriorThread:
+    """The prior-turn time, the surface the thread is bound to, and the
+    surface its latest attempt ran on.
+
+    The time is the latest attempt row's, never the thread's ``updated_at``: a
+    rename or a share bumps the thread stamp between turns, a concurrent POST
+    on another worker bumps it before losing admission, and the create-first
+    web flow leaves a thread behind when the send never happened, while an
+    attempt row is written only by a turn that was admitted. A thread with no
+    attempt has had no turn, so it has no prior-turn time.
+
+    An edit or a regenerate forks from an earlier turn, and the history the
+    model reads ends there, so its prior turn is the attempt before the fork
+    rather than the newest attempt on the thread.
+    """
+    try:
+        row, attempt = await asyncio.gather(
+            qr_db.get_thread_by_id(thread_id),
+            tl_db.get_latest_attempt(thread_id, before_turn=before_turn),
+        )
+    except Exception:
+        logger.debug("thread runtime-context read failed", exc_info=True)
+        return PriorThread()
+    if not row:
+        return PriorThread()
+
+    stamp = (attempt or {}).get("created_at")
+    last_turn_at = None
+    if isinstance(stamp, datetime):
+        # A naive stamp would raise against the envelope's aware clock.
+        last_turn_at = stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+
+    platform = row.get("platform")
+    ran_on = ((attempt or {}).get("metadata") or {}).get(SURFACE_KEY)
+    attempt_platform = ran_on.get("platform") if isinstance(ran_on, dict) else None
+    return PriorThread(
+        last_turn_at=last_turn_at,
+        platform=platform if isinstance(platform, str) and platform else None,
+        attempt_platform=(
+            attempt_platform
+            if isinstance(attempt_platform, str) and attempt_platform
+            else None
+        ),
+    )
+
+
+async def ensure_thread(
+    request: ChatRequest,
+    thread_id: str,
+    workspace_id: str,
+    user_id: str,
+    initial_query: str = "",
+) -> PriorThread:
+    """Ensure a thread record exists in the database, optionally with external linkage.
+
+    Returns the prior turn as it stood on entry, read here so the ordering
+    against the ensure below (which stamps the thread row) stays off the
+    callers.
+    """
+    prior = await _read_prior_thread(
+        thread_id, before_turn=_fork_predecessor_turn(request)
+    )
+
+    ensure_kwargs = dict(
+        workspace_id=workspace_id,
+        conversation_thread_id=thread_id,
+        user_id=user_id,
+        initial_query=initial_query,
+        initial_status="in_progress",
+    )
+    if request.platform:
+        ensure_kwargs["platform"] = request.platform
+    if request.external_thread_id:
+        ensure_kwargs["external_id"] = request.external_thread_id
+    if request.origin:
+        ensure_kwargs["metadata"] = {
+            "origin": request.origin.model_dump(exclude_none=True)
+        }
+    # Applied only if this send creates the thread; PATCH owns it after.
+    if request.subagents_allowed is not None:
+        ensure_kwargs["subagents_allowed"] = request.subagents_allowed
+    created = await qr_db.ensure_thread_exists(**ensure_kwargs)
+
+    # Threads born here (automations, channel gateways, legacy clients) never
+    # pass through POST /threads, so this is their only shot at an LLM title.
+    # Web create-first threads pre-exist → created=False → no double generation.
+    if created and initial_query:
+        from src.server.services.thread_title import schedule_title_generation
+
+        schedule_title_generation(
+            thread_id=thread_id,
+            user_id=user_id,
+            first_query=initial_query,
+            expected_title=initial_query[:255],
+            timezone=request.timezone,
+        )
+
+    return prior
+
+
+async def keep_named_model(thread_id: str, named_model: NamedModel | None) -> None:
+    """Keep the model a client named on its thread, once the turn is admitted.
+
+    Called after START commits and the run is attached, so a send refused
+    before admission, or a steer that never ran on the model it carried,
+    leaves the thread as it was, and the committed run always has an owner
+    when this waits on the database.
+    """
+    if named_model:
+        await remember_thread_llm_model(
+            thread_id, named_model.name, seen=named_model.seen
+        )
+
+
+def build_turn_context(
+    request: ChatRequest,
+    prior: PriorThread,
+    *,
+    user_profile: dict[str, Any] | None,
+    disk_free_mb: int | None = None,
+    disk_known: bool = False,
+    inherits_rules: bool = False,
+) -> TurnContext:
+    """What this turn knows about itself: the request's surface plus the prior row.
+
+    Origin, surface and rules all come from the request alone, because they
+    describe this turn. The stored origin is the thread's, and an automation's
+    thread can take a manual follow-up: that turn has a person waiting on it,
+    and the automation line in the rules would tell the model otherwise. An
+    automation stamps the origin on every request it sends, so nothing is lost.
+    ``disk_free_mb`` and ``disk_known`` come from :func:`read_disk_notice`.
+    ``inherits_rules`` is set for a retry whose attempt ran under the last
+    rules stated (:func:`retried_on_its_surface`).
+
+    The zone is the profile's before the request's: a channel or an
+    automation's own request names none, and the request alone would put
+    those turns on the locale default. When neither names one, as when the
+    profile read fails on such a turn, only ``tool_timezone`` takes the locale
+    default; the stamp keeps the frozen identity's zone.
+    """
+    zone = _first_zone((user_profile or {}).get("timezone"), request.timezone)
+    return TurnContext(
+        last_turn_at=prior.last_turn_at,
+        platform=request.platform,
+        origin=request.origin.type if request.origin else None,
+        origin_agent=request.origin.agent if request.origin else None,
+        surface_rules=request.surface_rules,
+        inherits_rules=inherits_rules or is_notification_turn(request),
+        disk_free_mb=disk_free_mb,
+        disk_known=disk_known,
+        timezone=zone,
+        tool_timezone=zone
+        or get_locale_config(request.locale or "en-US", "en").get("timezone", "UTC"),
+    )
+
+
+def is_notification_turn(request: ChatRequest) -> bool:
+    """Whether this server posted the turn itself, to report finished background
+    work, a market target's notice or a wakeup that fired.
+
+    A report-back arrives as a system query with no surface of its own, and a
+    wake as a ``market_target`` or ``wakeup`` query. Nobody sent any of them,
+    so it speaks where the thread's last turn did rather than naming a surface.
+    ``query_type`` is stripped from every request that is not the server's own
+    (``threads/messaging.py``), so a client cannot claim one.
+    """
+    return request.query_type in NOTIFICATION_QUERY_TYPES and not request.platform
+
+
+def turn_surface(request: ChatRequest, prior: PriorThread) -> Optional[str]:
+    """The name of the surface this turn's replies reach, without its symbol.
+
+    The request's own surface when it names one. A resumed interrupt can
+    arrive without one, and continues the attempt it answers, so it runs where
+    that attempt ran, as a retry does: the thread's bound surface would make
+    the answer to a web turn's question on a channel's thread the channel's.
+    A notification arrives without one too and continues work the thread
+    already had in hand, so it takes the surface the thread is bound to. Any
+    other turn without a surface is a plain web-app turn, which has none.
+    """
+    return parse_surface(_turn_platform(request, prior)).name
+
+
+def _turn_platform(request: ChatRequest, prior: PriorThread) -> Optional[str]:
+    """The surface :func:`turn_surface` names, as the request spells it."""
+    if request.platform:
+        return request.platform
+    if request.hitl_response:
+        return prior.attempt_platform
+    if is_notification_turn(request):
+        return prior.platform
+    return None
+
+
+#: The run-row key under which an attempt records where it ran, for its retry.
+SURFACE_KEY = "surface"
+
+
+def surface_stamp(
+    request: ChatRequest, prior: PriorThread, *, inherits_rules: bool
+) -> dict:
+    """START metadata naming the surface the attempt runs on and its rules.
+
+    ``/retry`` builds its attempt from the run row, with no surface, and the
+    thread's bound surface would make a web turn on a channel's thread the
+    channel's. So each attempt records where it ran and the rules it ran
+    under, and a retry of it runs there too (:func:`retried_on_its_surface`),
+    as does a resume of it (:func:`turn_surface`). A plain web-app turn
+    records nothing.
+    """
+    stamp: dict[str, Any] = {}
+    platform = _turn_platform(request, prior)
+    if platform:
+        stamp["platform"] = platform
+    if request.surface_rules:
+        stamp["rules"] = request.surface_rules
+    if inherits_rules:
+        stamp["inherits_rules"] = True
+    return {SURFACE_KEY: stamp} if stamp else {}
+
+
+async def retried_on_its_surface(request: ChatRequest) -> tuple[ChatRequest, bool]:
+    """A retry as the attempt it retries ran: on its surface, under its rules.
+
+    Returns the request to run and whether its turn runs under the last rules
+    stated. Any other turn, and a retry of an attempt that recorded no surface
+    (:func:`surface_stamp`), comes back as it is. A read failure fails the
+    turn start, as the retry's own predecessor check would.
+    """
+    if not request.retry_of_run_id or request.platform:
+        return request, False
+    run = await tl_db.get_run(request.retry_of_run_id)
+    stamp = ((run or {}).get("metadata") or {}).get(SURFACE_KEY)
+    if not isinstance(stamp, dict):
+        return request, False
+    platform, rules = stamp.get("platform"), stamp.get("rules")
+    request = request.model_copy(
+        update={
+            "platform": platform if isinstance(platform, str) and platform else None,
+            "surface_rules": rules if isinstance(rules, str) and rules else None,
+        }
+    )
+    return request, stamp.get("inherits_rules") is True
+
+
+async def read_disk_notice(workspace_id: str) -> tuple[int | None, bool]:
+    """The shared disk's free megabytes once low enough to tell the agent, and
+    whether a current reading backs the answer.
+
+    Read off the stored reading, never measured here: a turn does not wait on
+    the sandbox for context. A failed read is unknown, never "not low", so it
+    cannot take back an earlier low-disk line.
+    """
+    from src.server.database.computer import get_computer_for_workspace
+    from src.server.services.computer_disk import disk_is_known, low_disk_free_mb
+
+    try:
+        computer = await get_computer_for_workspace(workspace_id)
+    except Exception as e:  # noqa: BLE001 - context is never worth failing a turn for
+        logger.debug(f"Low-disk notice skipped for {workspace_id}: {e}")
+        return None, False
+    return low_disk_free_mb(computer), disk_is_known(computer)
+
+
+def _slash_text_target(content: Any) -> tuple[str, dict | None]:
+    """Locate the leading-slash text for command detection in a user message.
+
+    Returns ``(text, block)`` where ``block`` is the content-list element to
+    rewrite when stripping the prefix (``None`` for plain-string content). User
+    content is a block list when a supported attachment rewrites it
+    (``inject_multimodal_context``) or the client sends a multi-part message;
+    without scanning it, slash commands on those turns would be invisible. Only a
+    block whose text starts with ``/`` is considered, so attachment-label blocks
+    never false-match.
+    """
+    if isinstance(content, str):
+        return content, None
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "") or ""
+                if text.startswith("/"):
+                    return text, block
+    return "", None
+
+
+def user_skill_commands(config) -> dict[str, str] | None:
+    """Command → skill-name map for the turn user's skill customizations.
+
+    Read off the resolved ``AgentConfig`` (populated by ``resolve_llm_config``):
+    uploaded skills under their effective triggers, plus platform-command
+    renames (which ``detect_slash_commands`` treats as replacing the builtin
+    trigger). None when there is nothing to add, so slash detection falls back
+    to the builtin map alone.
+
+    Fold precedence, lowest first: platform renames, user-tier skills,
+    workspace-tier rows — so a workspace row wins a same-trigger collision in
+    its workspace, the invariant the cross-scope alias checks rely on.
+    """
+    if config is None:
+        return None
+    extra: dict[str, str] = {}
+    for name, command in (
+        getattr(config, "skill_command_overrides", None) or {}
+    ).items():
+        extra[command] = name
+    specs = sorted(
+        getattr(config, "user_skills", None) or [],
+        key=lambda s: getattr(s, "workspace_scoped", False),
+    )
+    for s in specs:
+        extra[s.command] = s.name
+    return extra or None
+
+
+def turn_skill_names(config) -> set[str] | None:
+    """The skill names this turn's build actually exposes.
+
+    Slash detection otherwise matches against the process-wide registry, which
+    knows nothing about this user's disables or feature opt-outs. A command
+    matching a skill the build then refuses does not error: the prefix is
+    stripped and nothing loads, so the model silently receives a shortened
+    message. Assembled from the config ``resolve_llm_config`` already
+    populated, by the same call the agent build makes, so the two cannot drift.
+    """
+    if config is None:
+        return None
+    from ptc_agent.agent.middleware.skills.registry import (
+        build_effective_skill_registry,
+    )
+
+    return set(
+        build_effective_skill_registry(
+            feature_resolver=getattr(config, "feature_enabled", None),
+            disabled_skills=getattr(config, "disabled_skills", None) or (),
+            user_skills=getattr(config, "user_skills", None) or (),
+            user_skill_dir=getattr(config, "user_skill_dir", None),
+            workspace_skill_dir=getattr(config, "workspace_skill_dir", None),
+        )
+    )
+
+
+def prepare_skill_contexts(
+    messages: list[dict],
+    request: ChatRequest,
+    extra_commands: dict[str, str] | None = None,
+    allowed_skills: set[str] | None = None,
+) -> list[dict]:
+    """Resolve which skills this turn activates, for the agent to inject.
+
+    Parses ``additional_context`` skill items and, as a fallback when none are
+    present, detects a leading ``/command`` in the last user message (stripping
+    the prefix in place). Returns plain ``{"name", "instruction"}`` dicts to thread
+    through ``config["configurable"]["skill_contexts"]`` — ``SkillsMiddleware`` then
+    loads the SKILL.md body once and dedups against bodies already live in the
+    thread. No body loading or checkpoint reads happen here.
+    """
+    skill_contexts = parse_skill_contexts(request.additional_context)
+
+    # Detect slash commands from message text (fallback for missing additional_context).
+    # Handles both plain-string content and the content-block list a supported
+    # attachment leaves behind, so `/cmd` + an image/PDF still activates the skill.
+    if not skill_contexts and not request.hitl_response and messages:
+        last_msg = messages[-1]
+        msg_text, text_block = _slash_text_target(last_msg.get("content"))
+        if msg_text:
+            cleaned_text, detected = detect_slash_commands(
+                msg_text,
+                extra_commands=extra_commands,
+                allowed_skills=allowed_skills,
+            )
+            if detected:
+                skill_contexts = detected
+                if cleaned_text != msg_text:
+                    if text_block is None:
+                        last_msg["content"] = cleaned_text
+                    else:
+                        text_block["text"] = cleaned_text
+
+    if skill_contexts:
+        logger.info(
+            f"[PTC_CHAT] Skills requested: {[s.name for s in skill_contexts]}"
+        )
+
+    return [
+        {"name": s.name, "instruction": s.instruction} for s in skill_contexts
+    ]
+
+
+async def turn_start_checkpoint_id(
+    thread_id: str, request: ChatRequest, checkpointer: Any
+) -> str | None:
+    """The checkpoint a new message runs from when the request names none and
+    the newest one is off the thread's branch (``turn_base_checkpoint_id``).
+
+    A HITL resume keeps the newest: it answers the pause there, and naming a
+    checkpoint would replay the pause's tasks that already finished. The route
+    refuses one whose pause is off the branch (``settle_resume_request``).
+    """
+    from src.server.utils.checkpoint_helpers import turn_base_checkpoint_id
+
+    if request.checkpoint_id or request.hitl_response:
+        return None
+    return await turn_base_checkpoint_id(checkpointer, thread_id)
+
+
+def _origin_metadata(request: ChatRequest, *, from_server: bool) -> dict[str, str]:
+    """Who sent the turn, so a trace can be split by what drove it.
+
+    Read per request rather than off the thread: an automation's thread takes
+    turns from a person too, and only the request says which this one is. A
+    turn the server posts itself (a report-back or a wake) carries no origin
+    either, so its query type, which no client can set, keeps it from reading
+    as the user's. Any client may name an origin, so only the server's own is
+    believed: a person's turn labelled an automation's would drop out of the
+    user traffic and pin its failures on an automation.
+    """
+    if request.query_type in NOTIFICATION_QUERY_TYPES:
+        return {"origin": "system", "query_type": request.query_type}
+    origin = request.origin
+    if origin is None or not from_server:
+        return {"origin": "user"}
+    fields = {"origin": origin.type}
+    if origin.type == "automation" and origin.id:
+        fields["automation_id"] = origin.id
+    return fields
+
+
+def build_graph_config(
+    thread_id: str,
+    user_id: str,
+    workspace_id: str,
+    timezone_str: str,
+    token_callback,
+    request: ChatRequest,
+    effective_model: str | None,
+    extra_configurable: dict | None = None,
+    skill_contexts: list[dict] | None = None,
+    skill_dirs: list[str] | None = None,
+    run_id: str | None = None,
+    turn_index: int | None = None,
+    surface: str | None = None,
+    base_checkpoint_id: str | None = None,
+    from_server: bool = False,
+) -> dict:
+    """Build the LangGraph ``config`` dict for a PTC turn.
+
+    ``extra_configurable`` is an optional dict merged into ``configurable``.
+    ``skill_contexts`` (+ ``skill_dirs``) are passed to ``SkillsMiddleware`` so it
+    injects each requested skill's SKILL.md body once; omit on HITL/replay turns.
+    ``run_id`` / ``turn_index`` are stamped into config metadata so the run's
+    checkpoints self-describe (checkpoint-sourced replay can correlate turns by
+    these instead of ordinal matching).
+    ``run_id`` and ``surface`` (from :func:`turn_surface`) also ride
+    ``configurable`` as ``run_id`` and ``platform``, which is where a tool
+    reads which run and which conversation it is acting in.
+    ``base_checkpoint_id`` is where a turn that names no checkpoint starts
+    (``turn_start_checkpoint_id``). ``from_server`` says the server sent the
+    request, so the trace believes the origin it names.
+    """
+    langsmith_tags = get_langsmith_tags(locale=request.locale)
+    langsmith_metadata = get_langsmith_metadata(
+        user_id=user_id,
+        workspace_id=workspace_id,
+        thread_id=thread_id,
+        workflow_type="ptc_agent",
+        locale=request.locale,
+        timezone=timezone_str,
+        llm_model=effective_model,
+        platform=request.platform,
+    )
+    if run_id is not None:
+        langsmith_metadata["run_id"] = run_id
+    if turn_index is not None:
+        langsmith_metadata["turn_index"] = turn_index
+    langsmith_metadata.update(_origin_metadata(request, from_server=from_server))
+
+    configurable: dict = {
+        "thread_id": thread_id,
+        "user_id": user_id,
+        "workspace_id": workspace_id,
+        "timezone": timezone_str,
+        "run_id": run_id,
+        "platform": surface,
+        # Only a turn a wakeup started may end without a reply. The type is
+        # server-only, so no client can claim it.
+        "wake_turn": request.query_type == WAKE_QUERY_TYPE,
+    }
+    # A command's report-back turn names the command, so the call that reads
+    # its notice brings the command's data sources with it. Its own field
+    # (``report_source``) is server-only; the trace stays on the command's row.
+    report = request.report_source
+    if isinstance(report, CommandReport):
+        configurable[REPORT_COMMAND_KEY] = report.command_id
+    if extra_configurable:
+        configurable.update(extra_configurable)
+    if skill_contexts:
+        configurable["skill_contexts"] = skill_contexts
+        if skill_dirs:
+            configurable["skill_dirs"] = skill_dirs
+
+    graph_config: dict = {
+        "configurable": configurable,
+        "recursion_limit": UNBOUNDED_RECURSION_LIMIT,
+        "tags": langsmith_tags,
+        "metadata": langsmith_metadata,
+    }
+
+    checkpoint_id = request.checkpoint_id or base_checkpoint_id
+    if checkpoint_id:
+        graph_config["configurable"]["checkpoint_id"] = checkpoint_id
+
+    if token_callback:
+        graph_config["callbacks"] = [token_callback]
+
+    # LANGSMITH_TRACING switches tracing on. The turn names its own tracer
+    # because the one langchain_core would build holds the turn's whole run
+    # tree until the turn ends.
+    return with_run_tracer(graph_config)

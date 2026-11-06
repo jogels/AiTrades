@@ -1,0 +1,120 @@
+"""Locks the snapshot frame's placement in the replay stream.
+
+The frame is additive — it must take the next flat ``id:`` and must never
+displace ``replay_done``, which v1 clients latch on. A snapshot outage is
+not a replay failure, so the None path is part of the contract.
+"""
+
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from tests.unit.server.services.history.replay_builders import replay_rows
+
+THREADS_MOD = "src.server.app.threads.messaging"
+
+THREAD = "11111111-1111-1111-1111-111111111111"
+
+
+def _replay_data():
+    """Owner matches create_test_app's override; no checkpoint pointer, so
+    replay takes the (empty) stub path without touching a DB."""
+    thread = {"conversation_thread_id": THREAD, "latest_checkpoint_id": None}
+    return replay_rows(thread, [], [], owner_id="test-user-123")
+
+
+def _parse(body: str) -> list[tuple[str, str]]:
+    """SSE text -> [(id, event)] in wire order."""
+    out = []
+    for block in body.strip().split("\n\n"):
+        lines = dict(
+            line.split(": ", 1) for line in block.splitlines() if ": " in line
+        )
+        if "event" in lines:
+            out.append((lines.get("id"), lines["event"]))
+    return out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "snapshot,expect_snapshot",
+    [
+        ({"active_runs": [], "revalidations": 0}, True),
+        (None, False),
+    ],
+)
+async def test_snapshot_frame_precedes_replay_done(
+    threads_client, snapshot, expect_snapshot
+):
+    with (
+        patch(
+            f"{THREADS_MOD}.get_replay_thread_data",
+            new=AsyncMock(return_value=_replay_data()),
+        ),
+        patch(
+            "src.server.services.history.snapshot.build_thread_snapshot",
+            new=AsyncMock(return_value=snapshot),
+        ),
+    ):
+        resp = await threads_client.get(
+            f"/api/v1/threads/{THREAD}/messages/replay"
+        )
+
+    assert resp.status_code == 200
+    frames = _parse(resp.text)
+    events = [event for _, event in frames]
+
+    if expect_snapshot:
+        assert events == ["snapshot", "replay_done"]
+    else:
+        assert events == ["replay_done"]
+
+    # Flat counter stays contiguous from 1 regardless of the snapshot.
+    assert [fid for fid, _ in frames] == [
+        str(i) for i in range(1, len(frames) + 1)
+    ]
+
+
+def _done(body: str) -> dict:
+    import json
+
+    for block in body.strip().split("\n\n"):
+        lines = dict(
+            line.split(": ", 1) for line in block.splitlines() if ": " in line
+        )
+        if lines.get("event") == "replay_done":
+            return json.loads(lines["data"])
+    raise AssertionError("no replay_done frame")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("", {"thread_id": THREAD, "latest_run_id": "run-9"}),
+        ("?limit=20", {"thread_id": THREAD, "latest_run_id": "run-9"}),
+        # An older page says nothing of the thread's newest run: its reader
+        # has the newest page's already.
+        ("?limit=20&before_turn=4", {"thread_id": THREAD}),
+    ],
+)
+async def test_replay_done_names_the_newest_run_on_the_newest_page(
+    threads_client, query, expected
+):
+    data = _replay_data()
+    data.thread["latest_run_id"] = "run-9"
+    with (
+        patch(
+            f"{THREADS_MOD}.get_replay_thread_data",
+            new=AsyncMock(return_value=data),
+        ),
+        patch(
+            "src.server.services.history.snapshot.build_thread_snapshot",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        resp = await threads_client.get(
+            f"/api/v1/threads/{THREAD}/messages/replay{query}"
+        )
+
+    assert resp.status_code == 200
+    assert _done(resp.text) == expected

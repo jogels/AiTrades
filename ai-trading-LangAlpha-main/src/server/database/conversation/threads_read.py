@@ -1,0 +1,847 @@
+"""Read models over conversation_threads: lookups, listings, auth metadata."""
+
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any, Tuple
+
+from psycopg.rows import dict_row
+
+from ptc_agent.core.paths import ARCHIVE_SCOPED_THREAD_DIRS
+from src.server.contracts.status import (
+    RAW_LIVE_STATUSES,
+    RAW_TERMINAL_SNAPSHOT_STATUSES,
+)
+from src.server.database import pool
+from src.server.database.conversation import _sql
+from src.server.utils.pg_sanitize import normalize_uuid
+
+logger = logging.getLogger(__name__)
+
+
+def _like_escape(value: str) -> str:
+    """Escape LIKE wildcards so caller-supplied prefixes match literally.
+
+    Use with `ESCAPE '\\'` in the LIKE clause so `_` and `%` in the prefix
+    (e.g. `market_view`) bind to themselves instead of matching any character.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def lookup_thread_by_external_id(
+    platform: str, external_id: str, user_id: str
+) -> Optional[str]:
+    """Look up thread_id by platform + external_id, scoped to user's workspaces.
+
+    Returns the conversation_thread_id if found, None otherwise.
+    """
+    try:
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT ct.conversation_thread_id
+                    FROM conversation_threads ct
+                    JOIN workspaces w ON ct.workspace_id = w.workspace_id
+                    WHERE ct.platform = %s
+                      AND ct.external_id = %s
+                      AND w.user_id = %s
+                    ORDER BY ct.updated_at DESC
+                    LIMIT 1
+                """,
+                    (platform, external_id, user_id),
+                )
+                result = await cur.fetchone()
+                if result:
+                    thread_id = str(result["conversation_thread_id"])
+                    logger.info(
+                        f"[conversation_db] lookup_thread_by_external_id "
+                        f"platform={platform} external_id={external_id} -> {thread_id}"
+                    )
+                    return thread_id
+                return None
+    except Exception as e:
+        logger.error(f"Error looking up thread by external_id: {e}")
+        return None
+
+
+async def get_thread_checkpoint_id(conversation_thread_id: str) -> str | None:
+    """Get the latest checkpoint ID stored for a thread."""
+    try:
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT latest_checkpoint_id FROM conversation_threads WHERE conversation_thread_id = %s",
+                    (conversation_thread_id,),
+                )
+                row = await cur.fetchone()
+                return row["latest_checkpoint_id"] if row else None
+    except Exception as e:
+        logger.error(f"Error getting thread checkpoint_id: {e}")
+        return None
+
+
+@dataclass(frozen=True)
+class ThreadBranchRead:
+    """The thread's commit pointer and its newest run's ``run_seq`` (0 when
+    it has none)."""
+
+    checkpoint_id: Optional[str]
+    run_horizon: int
+
+
+async def get_thread_branch_read(conversation_thread_id: str) -> ThreadBranchRead:
+    """The pointer and the run horizon, read in one snapshot.
+
+    A fork validated against the pointer is admitted after the pointer moved
+    only if no run started after this read. Read apart, a run admitted between
+    the two reads would sit inside the horizon while its branch is missing
+    from the pointer the fork was read off.
+    """
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT t.latest_checkpoint_id,
+                       COALESCE((
+                           SELECT max(r.run_seq) FROM conversation_responses r
+                           WHERE r.conversation_thread_id = t.conversation_thread_id
+                       ), 0) AS run_horizon
+                FROM conversation_threads t
+                WHERE t.conversation_thread_id = %s
+                """,
+                (conversation_thread_id,),
+            )
+            row = await cur.fetchone()
+    if row is None:
+        return ThreadBranchRead(None, 0)
+    return ThreadBranchRead(row["latest_checkpoint_id"], int(row["run_horizon"]))
+
+
+# Latest-attempt lifecycle columns joined onto paged thread rows. Ordered by
+# run_seq — the one monotonic run ordering (turn_index is reused by retries
+# and lowered by branch rewinds). Alias prefix `latest_` keeps the row dict
+# collision-free with thread columns.
+_LATEST_ATTEMPT_LATERAL = """
+    LEFT JOIN LATERAL (
+        SELECT cr.conversation_response_id AS latest_run_id,
+               cr.status AS latest_run_status,
+               cr.cancel_requested_at AS latest_cancel_requested_at,
+               cr.interrupt_reason AS latest_interrupt_reason,
+               cr.run_seq AS latest_run_seq,
+               cr.created_at AS latest_run_started_at
+        FROM conversation_responses cr
+        WHERE cr.conversation_thread_id = t.conversation_thread_id
+        ORDER BY cr.run_seq DESC
+        LIMIT 1
+    ) la ON TRUE
+"""
+
+_LATEST_ATTEMPT_LATERAL_COLS = (
+    "la.latest_run_id, la.latest_run_status, la.latest_cancel_requested_at, "
+    "la.latest_interrupt_reason, la.latest_run_seq, la.latest_run_started_at"
+)
+
+# Exact turn count for a paged row: conversation_queries is one-row-per-turn
+# (unique (thread_id, turn_index)), unlike conversation_responses where
+# retries duplicate turn_index.
+_TURN_COUNT_LATERAL = """
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS turn_count
+        FROM conversation_queries q
+        WHERE q.conversation_thread_id = t.conversation_thread_id
+    ) tc ON TRUE
+"""
+
+# A thread's title, or for an untitled one its first message: a hand-off's
+# thread runs before its title is written.
+_TITLE_OR_FIRST_QUERY = """
+    COALESCE(NULLIF(t.title, ''), (
+        SELECT left(q.content, 120) FROM conversation_queries q
+        WHERE q.conversation_thread_id = t.conversation_thread_id
+        ORDER BY q.turn_index ASC LIMIT 1
+    ))"""
+
+
+async def get_workspace_threads(
+    workspace_id: str,
+    limit: int = 20,
+    offset: int = 0,
+    sort_by: str = "updated_at",
+    sort_order: str = "desc",
+    platform_prefix: Optional[str] = None,
+    archived: bool = False,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Get threads for a workspace with pagination.
+
+    `platform_prefix`: if set, restricts to rows where `platform` LIKE
+    '<prefix>%' (e.g. "market_view" matches "market_view:AAPL" and any future
+    "market_view:*" suffixes). Sargable on Postgres btree, but after the
+    workspace_id filter this is a tiny scan in practice.
+
+    `archived`: the two views are disjoint — False (default) lists only
+    active threads, True lists only archived ones. Active listings sort
+    pinned-first ahead of the requested sort.
+    """
+    # Validate sort parameters
+    valid_sort_fields = ["created_at", "updated_at", "thread_index"]
+    if sort_by not in valid_sort_fields:
+        sort_by = "updated_at"
+
+    if sort_order.lower() not in ["asc", "desc"]:
+        sort_order = "desc"
+
+    archived_filter = (
+        " AND archived_at IS NOT NULL" if archived else " AND archived_at IS NULL"
+    )
+    inner_order = "" if archived else "is_pinned DESC, "
+    outer_order = "" if archived else "t.is_pinned DESC, "
+
+    where_extra = ""
+    extra_params: List[Any] = []
+    if platform_prefix:
+        where_extra = " AND platform LIKE %s ESCAPE '\\'"
+        extra_params.append(f"{_like_escape(platform_prefix)}%")
+
+    try:
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # Get total count
+                await cur.execute(
+                    f"""
+                    SELECT COUNT(*) as total
+                    FROM conversation_threads
+                    WHERE workspace_id = %s{archived_filter}{where_extra}
+                """,
+                    (workspace_id, *extra_params),
+                )
+
+                total_result = await cur.fetchone()
+                total_count = total_result["total"]
+
+                # Page the thread rows FIRST, then one lifecycle LATERAL over
+                # the paged set only — bounded by page size, never thread count.
+                query = f"""
+                    SELECT t.*, tc.turn_count, {_LATEST_ATTEMPT_LATERAL_COLS}
+                    FROM (
+                        SELECT {_sql._THREAD_COLUMNS}, last_seen_run_seq
+                        FROM conversation_threads
+                        WHERE workspace_id = %s{archived_filter}{where_extra}
+                        ORDER BY {inner_order}{sort_by} {sort_order.upper()},
+                                 conversation_thread_id DESC
+                        LIMIT %s OFFSET %s
+                    ) t
+                    {_TURN_COUNT_LATERAL}
+                    {_LATEST_ATTEMPT_LATERAL}
+                    ORDER BY {outer_order}t.{sort_by} {sort_order.upper()},
+                             t.conversation_thread_id DESC
+                """
+                await cur.execute(query, (workspace_id, *extra_params, limit, offset))
+
+                threads = await cur.fetchall()
+                return [dict(row) for row in threads], total_count
+
+    except Exception as e:
+        logger.error(f"Error getting threads for workspace: {e}")
+        raise
+
+
+async def get_threads_for_user(
+    user_id: str,
+    limit: int = 20,
+    offset: int = 0,
+    sort_by: str = "updated_at",
+    sort_order: str = "desc",
+    platform_prefix: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Get all threads for a user across all workspaces.
+
+    Archived threads are always excluded — the cross-workspace recency view
+    has no archived counterpart (the workspace listing serves that). Pinning
+    does not reorder here either: pin scope is within a workspace.
+
+    `platform_prefix`: optional prefix match on `platform` (e.g. "market_view").
+    """
+    sort_fields = {
+        "created_at": "t.created_at",
+        "updated_at": "t.updated_at",
+        "thread_index": "t.thread_index",
+    }
+    if sort_by not in sort_fields:
+        sort_by = "updated_at"
+
+    if sort_order.lower() not in ["asc", "desc"]:
+        sort_order = "desc"
+
+    order_by = sort_fields[sort_by]
+
+    where_extra = ""
+    extra_params: List[Any] = []
+    if platform_prefix:
+        where_extra = " AND t.platform LIKE %s ESCAPE '\\'"
+        extra_params.append(f"{_like_escape(platform_prefix)}%")
+
+    try:
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    f"""
+                    SELECT COUNT(*) as total
+                    FROM conversation_threads t
+                    JOIN workspaces w ON t.workspace_id = w.workspace_id
+                    WHERE w.user_id = %s AND w.status != 'deleted'
+                      AND t.archived_at IS NULL{where_extra}
+                    """,
+                    (user_id, *extra_params),
+                )
+                total_result = await cur.fetchone()
+                total_count = total_result["total"] if total_result else 0
+
+                # Page FIRST, then the per-row LATERALs run over the paged
+                # set only (first-query preview + lifecycle columns).
+                query = f"""
+                    SELECT t.*, fq.content AS first_query_content,
+                           tc.turn_count, {_LATEST_ATTEMPT_LATERAL_COLS}
+                    FROM (
+                        SELECT {_sql._THREAD_COLUMNS_T}, t.last_seen_run_seq
+                        FROM conversation_threads t
+                        JOIN workspaces w ON t.workspace_id = w.workspace_id
+                        WHERE w.user_id = %s AND w.status != 'deleted'
+                          AND t.archived_at IS NULL{where_extra}
+                        ORDER BY {order_by} {sort_order.upper()},
+                                 t.conversation_thread_id DESC
+                        LIMIT %s OFFSET %s
+                    ) t
+                    LEFT JOIN LATERAL (
+                        SELECT q.content
+                        FROM conversation_queries q
+                        WHERE q.conversation_thread_id = t.conversation_thread_id
+                        ORDER BY q.turn_index ASC
+                        LIMIT 1
+                    ) fq ON TRUE
+                    {_TURN_COUNT_LATERAL}
+                    {_LATEST_ATTEMPT_LATERAL}
+                    ORDER BY t.{sort_by} {sort_order.upper()},
+                             t.conversation_thread_id DESC
+                """
+                await cur.execute(query, (user_id, *extra_params, limit, offset))
+                threads = await cur.fetchall()
+                return [dict(row) for row in threads], total_count
+
+    except Exception as e:
+        logger.error(f"Error getting threads for user: {e}")
+        raise
+
+
+async def get_recent_threads_for_user(
+    user_id: str, *, exclude_thread_id: str | None = None, limit: int = 5
+) -> List[Dict[str, Any]]:
+    """The user's most recently active conversations, newest first.
+
+    Leaves out threads an automation started, which its runs already list, and
+    names an untitled thread by its first message, since a hand-off's thread
+    runs before its title is written. Each row carries the latest attempt's
+    ``latest_*`` columns for ``project_lifecycle``, read over the page alone.
+    """
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT t.conversation_thread_id, t.workspace_id, t.updated_at,
+                       t.workspace_name, {_TITLE_OR_FIRST_QUERY} AS title,
+                       {_LATEST_ATTEMPT_LATERAL_COLS}
+                FROM (
+                    SELECT t.conversation_thread_id, t.workspace_id, t.title,
+                           t.updated_at, w.name AS workspace_name
+                    FROM conversation_threads t
+                    JOIN workspaces w ON t.workspace_id = w.workspace_id
+                    WHERE w.user_id = %s AND w.status != 'deleted'
+                      AND t.archived_at IS NULL
+                      AND t.conversation_thread_id IS DISTINCT FROM %s::uuid
+                      AND (t.metadata->'origin'->>'type')
+                          IS DISTINCT FROM 'automation'
+                    ORDER BY t.updated_at DESC, t.conversation_thread_id DESC
+                    LIMIT %s
+                ) t
+                {_LATEST_ATTEMPT_LATERAL}
+                ORDER BY t.updated_at DESC, t.conversation_thread_id DESC
+                """,
+                (user_id, exclude_thread_id, limit),
+            )
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def get_thread_labels(
+    thread_ids: List[str], user_id: str
+) -> List[Dict[str, Any]]:
+    """Workspace and title labels for ``thread_ids``, oldest thread first.
+
+    Threads of another user or in a deleted workspace are left out. Non-UUID
+    ids are dropped pre-bind.
+    """
+    normalized = [nid for nid in (normalize_uuid(t) for t in thread_ids) if nid]
+    if not normalized:
+        return []
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT t.conversation_thread_id, t.workspace_id,
+                       w.name AS workspace_name,
+                       {_TITLE_OR_FIRST_QUERY} AS title
+                FROM conversation_threads t
+                JOIN workspaces w ON t.workspace_id = w.workspace_id
+                WHERE t.conversation_thread_id = ANY(%s)
+                  AND w.user_id = %s AND w.status != 'deleted'
+                ORDER BY t.created_at ASC, t.conversation_thread_id ASC
+                """,
+                (normalized, user_id),
+            )
+            return [
+                {
+                    "thread_id": str(row["conversation_thread_id"]),
+                    "workspace_id": str(row["workspace_id"]),
+                    "workspace_name": row["workspace_name"],
+                    "title": row["title"],
+                }
+                for row in await cur.fetchall()
+            ]
+
+
+# Feed snapshot in one statement (v6 §2.2). `owned` is the pre-filter set —
+# every latest attempt the user owns — so `watermark` advances even when both
+# branches come back empty. Branch `live` is UNCAPPED, so absence there proves
+# a run isn't live — for UNARCHIVED threads only: archiving is allowed on a
+# live run (the run survives, the row just leaves the lists), so an archived
+# thread can be absent here while still running. Branch `unseen` is capped by
+# the caller, newest first, so Python only has to notice the overflow row.
+# Archived threads are absent from both; the archive stamps the latest TERMINAL
+# attempt seen (GREATEST no-ops on a live one), so their absence is not
+# truncation.
+_LIFECYCLE_SNAPSHOT_SQL = f"""
+    WITH owned AS (
+        SELECT ct.conversation_thread_id, ct.workspace_id, ct.archived_at,
+               COALESCE(ct.last_seen_run_seq, 0) AS last_seen_run_seq,
+               la.latest_run_id, la.latest_run_status,
+               la.latest_cancel_requested_at,
+               la.latest_interrupt_reason, la.latest_run_seq,
+               la.latest_run_started_at
+        FROM conversation_threads ct
+        JOIN workspaces w ON w.workspace_id = ct.workspace_id
+        JOIN LATERAL (
+            SELECT cr.conversation_response_id AS latest_run_id,
+                   cr.status AS latest_run_status,
+                   cr.cancel_requested_at AS latest_cancel_requested_at,
+                   cr.interrupt_reason AS latest_interrupt_reason,
+                   cr.run_seq AS latest_run_seq,
+                   cr.created_at AS latest_run_started_at
+            FROM conversation_responses cr
+            WHERE cr.conversation_thread_id = ct.conversation_thread_id
+            ORDER BY cr.run_seq DESC
+            LIMIT 1
+        ) la ON TRUE
+        WHERE w.user_id = %s AND w.status != 'deleted'
+    ),
+    watermark AS (
+        SELECT COALESCE(MAX(latest_run_seq), 0) AS as_of_seq FROM owned
+    ),
+    live AS (
+        SELECT 'live' AS branch, o.* FROM owned o
+        WHERE o.archived_at IS NULL
+          AND o.latest_run_status IN ({_sql.sql_literals(RAW_LIVE_STATUSES)})
+    ),
+    unseen AS (
+        SELECT 'unseen' AS branch, o.* FROM owned o
+        WHERE o.archived_at IS NULL
+          AND o.latest_run_status IN (
+              {_sql.sql_literals(RAW_TERMINAL_SNAPSHOT_STATUSES)}
+          )
+          AND o.latest_run_seq > o.last_seen_run_seq
+        ORDER BY o.latest_run_seq DESC
+        LIMIT %s
+    )
+    SELECT wm.as_of_seq, sel.*
+    FROM watermark wm
+    LEFT JOIN LATERAL (
+        SELECT * FROM live
+        UNION ALL
+        SELECT * FROM unseen
+    ) sel ON TRUE
+"""
+
+
+async def get_thread_lifecycle_rows(
+    user_id: str, *, unseen_cap: int = 256
+) -> Tuple[List[Dict[str, Any]], int]:
+    """The feed snapshot's rows plus its watermark, classified in SQL.
+
+    Returns ``(rows, as_of_seq)``. Each row carries a ``branch`` of ``live``
+    or ``unseen``; at most ``unseen_cap + 1`` unseen rows come back so the
+    caller can set the truncation flag. ``as_of_seq`` is read over the
+    unfiltered owned set, so an empty snapshot still advances the client's
+    watermark. One LATERAL per owned thread, backed by
+    ``ix_responses_thread_run_seq``; threads with no runs are excluded (they
+    have no lifecycle to report).
+    """
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                _LIFECYCLE_SNAPSHOT_SQL, (user_id, unseen_cap + 1)
+            )
+            fetched = [dict(r) for r in await cur.fetchall()]
+    if not fetched:
+        return [], 0
+    as_of_seq = int(fetched[0].get("as_of_seq") or 0)
+    # The LEFT JOIN yields one all-NULL row when both branches are empty.
+    return [r for r in fetched if r.get("branch")], as_of_seq
+
+
+async def get_thread_with_summary(
+    conversation_thread_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Get thread with enriched summary data (pair count, costs, etc.)."""
+    try:
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # Get thread basic info
+                await cur.execute(
+                    """
+                    SELECT conversation_thread_id, workspace_id, current_status, thread_index, created_at, updated_at
+                    FROM conversation_threads
+                    WHERE conversation_thread_id = %s
+                """,
+                    (conversation_thread_id,),
+                )
+
+                thread = await cur.fetchone()
+                if not thread:
+                    return None
+
+                thread = dict(thread)
+
+                # Aggregates: pair/time/error over the settled attempt per
+                # turn (superseded attempts must not inflate them), but cost
+                # over ALL usage rows — spend on failed attempts is real.
+                await cur.execute(
+                    f"""
+                    SELECT
+                        COUNT(q.turn_index) as pair_count,
+                        (SELECT COALESCE(SUM((u.token_usage->>'total_cost')::float), 0)
+                         FROM conversation_usages u
+                         WHERE u.conversation_thread_id = %s) as total_cost,
+                        COALESCE(SUM(r.execution_time), 0) as total_execution_time,
+                        MAX(q.type) as last_query_type,
+                        BOOL_OR(COALESCE(array_length(r.errors, 1), 0) > 0) as has_errors
+                    FROM conversation_queries q
+                    LEFT JOIN ({_sql._SETTLED_ATTEMPTS}) r ON q.turn_index = r.turn_index
+                    WHERE q.conversation_thread_id = %s
+                """,
+                    (
+                        conversation_thread_id,
+                        conversation_thread_id,
+                        conversation_thread_id,
+                    ),
+                )
+
+                stats = await cur.fetchone()
+                if stats:
+                    thread.update(dict(stats))
+
+                return thread
+
+    except Exception as e:
+        logger.error(f"Error getting thread with summary: {e}")
+        raise
+
+
+@dataclass(frozen=True)
+class ThreadPrefixes:
+    """A workspace's thread id prefixes, which key its per-thread sandbox dirs.
+
+    Two threads can share a prefix, so cleanup keeps any prefix a kept thread
+    still uses. ``all`` is every thread that exists; ``open`` every one not
+    archived, or archived but still in use: its latest run is live or began
+    after the archive (nothing refuses a turn in an archived thread, and an
+    automation keeps running in its own), or a background subagent it
+    dispatched is still running.
+    """
+
+    all: frozenset[str]
+    open: frozenset[str]
+
+    def keeps(self, base: str) -> frozenset[str]:
+        """The prefixes whose dirs under ``base`` stay."""
+        return self.open if base in ARCHIVE_SCOPED_THREAD_DIRS else self.all
+
+
+_THREAD_PREFIXES_SQL = f"""
+    SELECT left(ct.conversation_thread_id::text, 8) AS prefix,
+           bool_or(COALESCE(
+               ct.archived_at IS NULL
+               OR latest.status IN ({_sql.sql_literals(RAW_LIVE_STATUSES)})
+               OR latest.created_at > ct.archived_at
+               OR EXISTS (
+                   SELECT 1 FROM subagent_runs sr
+                   WHERE sr.thread_id = ct.conversation_thread_id
+                     AND sr.status = 'in_progress'
+               ),
+               false
+           )) AS open
+    FROM conversation_threads ct
+    LEFT JOIN LATERAL (
+        SELECT cr.status, cr.created_at
+        FROM conversation_responses cr
+        WHERE cr.conversation_thread_id = ct.conversation_thread_id
+          AND ct.archived_at IS NOT NULL
+        ORDER BY cr.run_seq DESC
+        LIMIT 1
+    ) latest ON true
+    WHERE ct.workspace_id = %s
+    GROUP BY 1
+"""
+
+
+async def _thread_prefixes(conn, workspace_id: str) -> ThreadPrefixes:
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(_THREAD_PREFIXES_SQL, (workspace_id,))
+        rows = await cur.fetchall()
+    return ThreadPrefixes(
+        all=frozenset(row["prefix"] for row in rows),
+        open=frozenset(row["prefix"] for row in rows if row["open"]),
+    )
+
+
+async def get_workspace_thread_prefixes(workspace_id: str, conn=None) -> ThreadPrefixes:
+    async with pool.get_db_connection(conn) as conn:
+        return await _thread_prefixes(conn, workspace_id)
+
+
+@asynccontextmanager
+async def fenced_workspace_thread_prefixes(
+    workspace_id: str,
+) -> AsyncIterator[ThreadPrefixes]:
+    """The prefixes, with the workspace row held FOR UPDATE until the block
+    exits, for a caller removing the dirs of the threads that are not kept.
+
+    Admission holds that row FOR SHARE until its run row commits, root runs
+    and background subagents alike, so no run starts writing to a dir between
+    this read and the removal: a turn admitted before the read is live in it,
+    and one admitted after waits for the block to end.
+    """
+    async with pool.get_db_connection() as conn, conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM workspaces WHERE workspace_id = %s FOR UPDATE",
+                (workspace_id,),
+            )
+        yield await _thread_prefixes(conn, workspace_id)
+
+
+async def list_computer_threads(
+    computer_id: str, *, rows: bool = True
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Threads of every live workspace on a computer, newest first, and
+    whether each has a stored transcript: the computer's thread index.
+
+    Also a digest of every one of those fields, from the same snapshot, which
+    changes whenever any of them does; ``rows=False`` returns the digest
+    alone, for the price of one row.
+    """
+    digest = """
+        WITH threads AS (
+            SELECT t.conversation_thread_id, t.title, t.created_at,
+                   t.updated_at, w.workspace_id,
+                   w.name AS workspace_name, w.dir_name,
+                   EXISTS (
+                       SELECT 1 FROM thread_transcripts s
+                       WHERE s.conversation_thread_id = t.conversation_thread_id
+                   ) AS has_transcript
+            FROM conversation_threads t
+            JOIN workspaces w ON w.workspace_id = t.workspace_id
+            WHERE w.computer_id = %s AND w.status <> 'deleted'
+        ),
+        digest AS (
+            SELECT encode(sha256(convert_to(coalesce(string_agg(
+                       row_to_json(threads)::text, E'\\n'
+                       ORDER BY threads.conversation_thread_id
+                   ), ''), 'UTF8')), 'hex') AS digest
+            FROM threads
+        )
+    """
+    query = (
+        # One statement, so the digest is of exactly the rows returned. The
+        # join keeps the digest's row when there are no threads.
+        digest
+        + """
+        SELECT digest.digest, threads.*
+        FROM digest LEFT JOIN threads ON TRUE
+        ORDER BY threads.updated_at DESC, threads.conversation_thread_id
+        """
+        if rows
+        else digest + "SELECT digest FROM digest"
+    )
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(query, (computer_id,))
+            found = await cur.fetchall()
+    threads = [
+        {k: v for k, v in row.items() if k != "digest"}
+        for row in found
+        if row.get("conversation_thread_id") is not None
+    ]
+    return found[0]["digest"], threads
+
+
+async def get_thread_by_id(conversation_thread_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Get thread by ID.
+
+    Args:
+        conversation_thread_id: Thread ID
+
+    Returns:
+        Thread dict or None if not found
+    """
+    conversation_thread_id = normalize_uuid(conversation_thread_id)
+    if conversation_thread_id is None:
+        return None
+
+    try:
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    f"""
+                    SELECT {_sql._THREAD_COLUMNS},
+                           share_token, share_permissions, shared_at
+                    FROM conversation_threads
+                    WHERE conversation_thread_id = %s
+                """,
+                    (conversation_thread_id,),
+                )
+
+                result = await cur.fetchone()
+                return dict(result) if result else None
+
+    except Exception as e:
+        logger.error(f"Error getting thread by id: {e}")
+        raise
+
+
+async def get_thread_owner_id(thread_id: str, *, conn=None) -> Optional[str]:
+    """Return the user_id that owns the thread's workspace, or None if not found.
+
+    Delegates to ``get_thread_auth_meta`` (the superset query) to avoid a
+    near-duplicate JOIN; UUID normalization / not-found handling live there.
+    """
+    meta = await get_thread_auth_meta(thread_id, conn=conn)
+    return meta["user_id"] if meta else None
+
+
+async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
+    """Owner ``user_id`` + ``is_shared`` + ``msg_type`` + ``workspace_id`` +
+    ``llm_model`` + ``reasoning_effort`` + ``fast_mode`` in one query.
+
+    Lets ``/status`` authorize the caller and read share state from a single
+    round-trip, and lets a send authorize, find its workspace and read the
+    thread's model and tuning from the same one. Returns ``None`` if the thread
+    doesn't exist.
+    """
+    # Same UUID normalization as get_thread_owner_id: a non-UUID id can't match
+    # the column, so treat it as not-found (clean 404) rather than risk a 500.
+    thread_id = normalize_uuid(thread_id)
+    if thread_id is None:
+        return None
+    try:
+        async with pool.get_db_connection(conn) as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT w.user_id, t.is_shared, t.msg_type, t.workspace_id,
+                           t.llm_model, t.reasoning_effort, t.fast_mode
+                    FROM conversation_threads t
+                    JOIN workspaces w ON w.workspace_id = t.workspace_id
+                    WHERE t.conversation_thread_id = %s
+                    """,
+                    (thread_id,),
+                )
+                result = await cur.fetchone()
+                return dict(result) if result else None
+    except Exception as e:
+        logger.error(f"Error getting thread auth meta: {e}")
+        raise
+
+
+async def read_thread_subagents_allowed(thread_id: str) -> bool | None:
+    """The thread's effective subagent switch; None for a malformed id or no row.
+
+    Read on every main-agent model call and before every subagent launch,
+    never cached, so a flip, or a change to the owner's default, reaches a
+    running turn whichever worker served it. A failed read raises: the caller
+    decides what an unknown switch means.
+    """
+    thread_id = normalize_uuid(thread_id)
+    if thread_id is None:
+        return None
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            # A thread with no value of its own (NULL) follows its owner's default.
+            await cur.execute(
+                f"""
+                SELECT COALESCE(
+                    t.subagents_allowed,
+                    {_sql.owner_subagents_default("t.workspace_id")}
+                ) AS allowed
+                FROM conversation_threads t
+                WHERE t.conversation_thread_id = %s
+                """,
+                (thread_id,),
+            )
+            row = await cur.fetchone()
+    return None if row is None else row["allowed"]
+
+
+async def get_thread_by_share_token(share_token: str) -> Optional[Dict[str, Any]]:
+    """
+    Get a shared thread by its public share token.
+
+    Returns thread info + workspace_id + workspace name only if is_shared = TRUE,
+    with the workspace's folder and the root of the computer it is on, which
+    the agent's absolute paths are spelled with, and the roots of the
+    computers it moved off, which an older turn's paths are spelled with.
+    """
+    try:
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT
+                        t.conversation_thread_id,
+                        t.workspace_id,
+                        t.current_status,
+                        t.msg_type,
+                        t.title,
+                        t.share_token,
+                        t.is_shared,
+                        t.share_permissions,
+                        t.shared_at,
+                        t.created_at,
+                        t.updated_at,
+                        w.name AS workspace_name,
+                        w.dir_name,
+                        w.previous_root_dirs,
+                        c.root_dir
+                    FROM conversation_threads t
+                    JOIN workspaces w ON w.workspace_id = t.workspace_id
+                    LEFT JOIN computers c ON c.computer_id = w.computer_id
+                    WHERE t.share_token = %s AND t.is_shared = TRUE
+                """,
+                    (share_token,),
+                )
+
+                result = await cur.fetchone()
+                return dict(result) if result else None
+
+    except Exception as e:
+        logger.error(f"Error getting thread by share token: {e}")
+        raise

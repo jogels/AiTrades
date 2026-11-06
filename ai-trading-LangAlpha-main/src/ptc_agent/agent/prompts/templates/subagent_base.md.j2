@@ -1,0 +1,97 @@
+{{ identity_line | default("You are a task execution sub-agent.") }}
+
+<time_rules>
+{% include 'components/time_rules.md.j2' %}
+</time_rules>
+{% if section_task_workflow | default(false) %}
+
+<task_workflow>
+{% include 'components/task_workflow.md.j2' %}
+</task_workflow>
+{% endif %}
+{% if section_workspace_paths | default(false) %}
+
+<workspace_paths>
+{% include 'components/workspace_paths.md.j2' %}
+</workspace_paths>
+{% endif %}
+{% if section_memory_system | default(false) %}
+
+<memory_system>
+{% include 'subagents/memory.md.j2' %}
+</memory_system>
+{% endif %}
+{% if section_thread_scratchpad | default(false) %}
+
+<thread_scratchpad>
+{% include 'subagents/scratchpad.md.j2' %}
+</thread_scratchpad>
+{% endif %}
+{% if section_security_policy | default(false) %}
+
+<security_policy>
+{% include 'components/security_policy.md.j2' %}
+</security_policy>
+{% endif %}
+{% if section_tool_guide | default(false) %}
+
+<tool_guide>
+{% include 'components/tool_guide.md.j2' %}
+</tool_guide>
+{% endif %}
+{% if section_subagent_coordination | default(false) %}
+
+<subagent_coordination>
+{% include 'components/subagent_coordination.md.j2' %}
+</subagent_coordination>
+{% endif %}
+{% if section_data_processing | default(false) %}
+
+<data_processing>
+{% include 'components/data_processing.md.j2' %}
+</data_processing>
+{% endif %}
+{% if section_visualizations | default(false) %}
+
+<visualizations>
+{% include 'components/visualizations.md.j2' %}
+</visualizations>
+{% endif %}
+{% if section_output_guidelines | default(false) %}
+
+<output_guidelines>
+{% include 'components/output_guidelines.md.j2' %}
+</output_guidelines>
+{% endif %}
+
+<citation_rules>
+{% include 'components/citation_rules.md.j2' %}
+</citation_rules>
+{% if section_workspace_context | default(false) %}
+
+<workspace_context>
+{% include 'components/workspace_context.md.j2' %}
+</workspace_context>
+{% endif %}
+{% if section_ask_user_guidelines | default(false) and ask_user_enabled | default(false) %}
+
+<ask_user_guidelines>
+{% include 'components/ask_user_guidelines.md.j2' %}
+</ask_user_guidelines>
+{% endif %}
+{% if role_prompt %}
+
+<role>
+{% if tools_narrowed | default(false) %}
+Your tools here are narrower than this role was written for, so parts of this prompt may name a tool you don't have. Use only the tools you have; when a step needs one you don't, leave that step and say so in your result, so the parent agent can do it.
+
+{% endif %}
+{{ role_prompt }}
+</role>
+{% endif %}
+{% if preloaded_skills_content %}
+
+<preloaded_skills>
+{{ preloaded_skills_content }}
+</preloaded_skills>
+{% endif %}

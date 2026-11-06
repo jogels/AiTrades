@@ -1,0 +1,34 @@
+/* The fill lives here rather than in the pill's inline style, where it would
+   outrank the hover. */
+.cite-bubble-pill {
+  background: var(--color-bg-elevated);
+  transition: background-color var(--motion-quick) var(--ease-out);
+}
+
+.cite-bubble-pill:hover {
+  background: var(--color-bg-input);
+}
+
+.cite-bubble-card-title:hover {
+  color: var(--color-accent-primary);
+}
+
+@media print {
+  .cite-bubble-pill {
+    all: unset !important;
+    font-size: 0.75em !important;
+    color: #666 !important;
+  }
+
+  .cite-bubble-pill::before {
+    content: "[";
+  }
+
+  .cite-bubble-pill::after {
+    content: "]";
+  }
+
+  .cite-bubble-pill img {
+    display: none !important;
+  }
+}

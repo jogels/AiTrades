@@ -1,0 +1,36 @@
+/* ============================================
+   Entry Point - Tailwind + Global Styles
+   ============================================ */
+
+/* Tokens + global styles first, then Tailwind's pieces in v3's order: theme
+   (with the v3 defaults v4 changed laid over it), preflight, the app's base
+   rules on top of preflight, utilities last.
+
+   Tailwind is imported piece by piece rather than as `@import 'tailwindcss'`
+   because that form puts preflight and every utility in a cascade layer, and
+   an unlayered rule beats a layered one whatever its specificity. The
+   component stylesheets are unlayered, so layered utilities would lose every
+   tie they win today, and the focus-defaults layer in tokens.css is built on
+   Tailwind's rules sitting outside any layer (see the note there). Only the
+   theme variables go in a layer; tokens.css declares the values that matter. */
+@import './styles/tokens.css';
+@import './styles/animations.css';
+@import './styles/chrome.css';
+@import './styles/dotGrid.css';
+
+@import './styles/tailwind-theme.css';
+@import 'tailwindcss/preflight.css';
+@import './styles/base.css';
+@import 'tailwindcss/utilities.css' source(none);
+
+/* The app's own files, as v3's `content` listed them. Automatic detection would
+   also read e2e/, scripts/ and the docs, and v4 reads more words as classes
+   than v3 did (a test's `row-1` test id became a grid-row rule), so the unit
+   tests are left out too: nothing they render ships. */
+@source '../index.html';
+@source './**/*.{js,ts,jsx,tsx}';
+@source not './**/__tests__/**';
+@source not './**/*.test.{js,ts,jsx,tsx}';
+/* The onboarding scenes generate their own, which load with them
+   (introScenes/scenes.css). */
+@source not './pages/Onboarding/engine/introScenes/**';
