@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Trading Bot Dashboard</title>
+  <!-- Google Fonts: Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            brand: {
+              dark: '#0a0d14',
+              card: '#111726',
+              cardSoft: '#161d31',
+              cardHover: '#1c253d',
+              border: '#1f2942',
+              borderLight: '#2a3759',
+              blue: '#2b66ff',
+              blueHover: '#1f53db',
+              green: '#00d084',
+              greenSoft: '#00d0841a',
+              red: '#ff4d6a',
+              redSoft: '#ff4d6a1a',
+              yellow: '#f59e0b',
+              yellowSoft: '#f59e0b1a',
+              textMuted: '#7f8ea3',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- React 18 & Babel CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <style>
+    body {
+      background-color: #080b11;
+      color: #e2e8f0;
+      font-family: 'Inter', sans-serif;
+      overflow-x: hidden;
+    }
+    /* Custom Scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0d121f;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #222d47;
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #2b395b;
+    }
+    .glow-blue {
+      box-shadow: 0 0 20px -3px rgba(43, 102, 255, 0.45);
+    }
+  </style>
+</head>
+<body class="bg-[#080b11] text-slate-100 min-h-screen selection:bg-brand-blue selection:text-white">
+  <div id="root"></div>
+
+  <!-- React Application Code -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // Initial mock coin list
+    const INITIAL_COINS = [
+      { id: 'BTC', name: 'Bitcoin', symbol: 'BTC/USDT', price: 67430.25, change: 2.15, isFav: true, color: '#f7931a' },
+      { id: 'ETH', name: 'Ethereum', symbol: 'ETH/USDT', price: 3420.17, change: 1.72, isFav: true, color: '#627eea' },
+      { id: 'SOL', name: 'Solana', symbol: 'SOL/USDT', price: 148.32, change: -0.85, isFav: true, color: '#14f195' },
+      { id: 'BNB', name: 'BNB', symbol: 'BNB/USDT', price: 602.21, change: 0.64, isFav: true, color: '#f3ba2f' },
+      { id: 'XRP', name: 'XRP', symbol: 'XRP/USDT', price: 0.5421, change: -0.12, isFav: true, color: '#23292f' },
+      { id: 'DOGE', name: 'Dogecoin', symbol: 'DOGE/USDT', price: 0.1927, change: 1.20, isFav: false, color: '#c2a633' },
+      { id: 'LINK', name: 'Chainlink', symbol: 'LINK/USDT', price: 14.87, change: 0.57, isFav: false, color: '#375bd2' },
+      { id: 'ADA', name: 'Cardano', symbol: 'ADA/USDT', price: 0.4512, change: -1.45, isFav: false, color: '#0033ad' },
+      { id: 'AVAX', name: 'Avalanche', symbol: 'AVAX/USDT', price: 28.94, change: 3.82, isFav: false, color: '#e84142' }
+    ];
+
+    // Initial Log Items matching template image
+    const INITIAL_LOGS = [
+      { id: 1, time: '21:45:32', type: 'buy', color: 'green', text: 'Bot executed BUY order: SOL/USDT at 148.20 (Qty: 10)' },
+      { id: 2, time: '21:44:17', type: 'condition', color: 'yellow', text: 'Market condition met: RSI < 30, preparing to buy...' },
+      { id: 3, time: '21:40:10', type: 'update', color: 'blue', text: 'Position updated: BTC/USDT +0.85% (Unrealized PnL: +12.56 USDT)' },
+      { id: 4, time: '21:35:05', type: 'system', color: 'green', text: 'Bot started successfully' },
+      { id: 5, time: '21:30:00', type: 'system', color: 'green', text: 'System: Connected to Binance API' }
+    ];
+
+    function App() {
+      const [activeNav, setActiveNav] = useState('Dashboard');
+      const [selectedCoin, setSelectedCoin] = useState(INITIAL_COINS[0]);
+      const [coins, setCoins] = useState(INITIAL_COINS);
+      const [activeCoinTab, setActiveCoinTab] = useState('Favorites');
+      const [timeframe, setTimeframe] = useState('15m');
+      const [activeTool, setActiveTool] = useState('crosshair');
+      const [activeLogTab, setActiveLogTab] = useState('Logs');
+      const [logs, setLogs] = useState(INITIAL_LOGS);
+      const [botActive, setBotActive] = useState(true);
+      const [modalMode, setModalMode] = useState(null); // 'buy' | 'sell' | 'import' | null
+      const [orderQty, setOrderQty] = useState('0.1');
+
+      // Random price ticker effect
+      useEffect(() => {
+        const interval = setInterval(() => {
+          setCoins(prevCoins =>
+            prevCoins.map(coin => {
+              const deltaPercent = (Math.random() - 0.49) * 0.15;
+              const newPrice = +(coin.price * (1 + deltaPercent / 100)).toFixed(coin.price < 2 ? 4 : 2);
+              const newChange = +(coin.change + deltaPercent * 0.5).toFixed(2);
+              return { ...coin, price: newPrice, change: newChange };
+            })
+          );
+        }, 3000);
+        return () => clearInterval(interval);
+      }, []);
+
+      // Keep selectedCoin in sync with updated prices
+      useEffect(() => {
+        const found = coins.find(c => c.id === selectedCoin.id);
+        if (found) setSelectedCoin(found);
+      }, [coins]);
+
+      // Streaming logs simulator
+      useEffect(() => {
+        if (!botActive) return;
+        const logEvents = [
+          { type: 'update', color: 'blue', text: () => `Signal check: ${selectedCoin.id} MACD Golden Cross confirmed on ${timeframe}` },
+          { type: 'condition', color: 'yellow', text: () => `Order book depth analyzed: Liquidity ratio optimal for ${selectedCoin.id}` },
+          { type: 'buy', color: 'green', text: () => `Strategy Agent Alpha: Position size rebalanced (+0.25 ${selectedCoin.id})` },
+          { type: 'update', color: 'blue', text: () => `Trailing Stop-Loss updated to $${(selectedCoin.price * 0.985).toFixed(2)}` }
+        ];
+
+        const logTimer = setInterval(() => {
+          const now = new Date();
+          const timeStr = now.toTimeString().split(' ')[0];
+          const randomEv = logEvents[Math.floor(Math.random() * logEvents.length)];
+          const newEntry = {
+            id: Date.now(),
+            time: timeStr,
+            type: randomEv.type,
+            color: randomEv.color,
+            text: randomEv.text()
+          };
+          setLogs(prev => [newEntry, ...prev.slice(0, 19)]);
+        }, 9000);
+
+        return () => clearInterval(logTimer);
+      }, [botActive, selectedCoin, timeframe]);
+
+      const filteredCoins = coins.filter(c => {
+        if (activeCoinTab === 'Favorites') return c.isFav;
+        if (activeCoinTab === 'Trending') return true;
+        if (activeCoinTab === 'Gainers') return c.change > 0;
+        if (activeCoinTab === 'Losers') return c.change < 0;
+        return true;
+      });
+
+      return (
+        <div className="flex h-screen w-screen overflow-hidden bg-[#090d16]">
+          {/* LEFT SIDEBAR */}
+          <aside className="w-64 flex-shrink-0 bg-[#0c111e] border-r border-[#1a233a] flex flex-col justify-between p-4 select-none">
+            <div>
+              {/* Logo */}
+              <div className="flex items-center space-x-3 px-2 py-3 mb-6">
+                <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-brand-blue to-cyan-400 flex items-center justify-center shadow-lg shadow-blue-500/30">
+                  <svg className="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                  </svg>
+                </div>
+                <div>
+                  <h1 className="text-base font-bold text-white tracking-wide">AI Trading Bot</h1>
+                  <span className="text-xs text-brand-textMuted font-mono">v2.6.2 Engine</span>
+                </div>
+              </div>
+
+              {/* Navigation Links */}
+              <nav className="space-y-1.5">
+                {[
+                  { name: 'Dashboard', icon: 'M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z' },
+                  { name: 'My Bots', icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' },
+                  { name: 'Performance', icon: 'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z' },
+                  { name: 'Settings', icon: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z' },
+                  { name: 'Help', icon: 'M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z' }
+                ].map(item => {
+                  const isActive = activeNav === item.name;
+                  return (
+                    <button
+                      key={item.name}
+                      onClick={() => setActiveNav(item.name)}
+                      className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl font-medium text-sm transition-all duration-150 ${
+                        isActive
+                          ? 'bg-brand-blue text-white shadow-md shadow-blue-600/30 font-semibold'
+                          : 'text-slate-400 hover:text-slate-200 hover:bg-[#151c2e]'
+                      }`}
+                    >
+                      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d={item.icon} />
+                      </svg>
+                      <span>{item.name}</span>
+                    </button>
+                  );
+                })}
+              </nav>
+            </div>
+
+            {/* Bottom Status Cards */}
+            <div className="space-y-3">
+              {/* Bot Status Card */}
+              <div 
+                onClick={() => setBotActive(!botActive)}
+                className="bg-[#121929] border border-[#1e273f] rounded-xl p-3 flex items-center justify-between cursor-pointer hover:border-[#2d3a5e] transition"
+              >
+                <div className="flex items-center space-x-2.5">
+                  <div className="relative">
+                    <span className={`block w-2.5 h-2.5 rounded-full ${botActive ? 'bg-brand-green animate-pulse' : 'bg-brand-red'}`}></span>
+                    {botActive && <span className="absolute -inset-0.5 rounded-full bg-brand-green opacity-40 animate-ping"></span>}
+                  </div>
+                  <div>
+                    <span className="text-xs text-slate-400 block font-medium">Bot Status</span>
+                    <span className={`text-xs font-semibold ${botActive ? 'text-brand-green' : 'text-brand-red'}`}>
+                      {botActive ? 'Active' : 'Paused'}
+                    </span>
+                  </div>
+                </div>
+                <span className="text-[10px] text-slate-500 bg-[#172136] px-2 py-0.5 rounded">
+                  {botActive ? 'ON' : 'OFF'}
+                </span>
+              </div>
+
+              {/* Storage / Limit Card */}
+              <div className="bg-[#121929] border border-[#1e273f] rounded-xl p-3">
+                <div className="flex items-center justify-between text-xs mb-2">
+                  <span className="text-slate-400 flex items-center gap-1.5">
+                    <svg className="w-4 h-4 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M4 7v10c0 2 1.5 3 3.5 3h9c2 0 3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3h9c2 0 3.5 1 3.5 3M4 7h16m-8 4v6m-4-3h8" />
+                    </svg>
+                    Storage
+                  </span>
+                  <span className="font-semibold text-slate-300 font-mono">1 / 5 Bots</span>
+                </div>
+                <div className="w-full bg-[#1c263e] h-1.5 rounded-full overflow-hidden">
+                  <div className="bg-gradient-to-r from-brand-blue to-cyan-400 h-full rounded-full" style={{ width: '20%' }}></div>
+                </div>
+              </div>
+            </div>
+          </aside>
+
+          {/* MAIN WORKSPACE */}
+          <main className="flex-1 flex flex-col overflow-y-auto overflow-x-hidden bg-[#090d16]">
+            {/* Top Action Bar */}
+            <header className="h-16 px-6 border-b border-[#182137] flex items-center justify-between bg-[#0b101c]/80 backdrop-blur-md sticky top-0 z-20">
+              {/* Action Buttons */}
+              <div className="flex items-center space-x-3">
+                <button
+                  onClick={() => setModalMode('buy')}
+                  className="px-6 py-2 rounded-xl text-sm font-semibold bg-brand-blue hover:bg-brand-blueHover text-white transition shadow-lg shadow-blue-600/25 active:scale-95"
+                >
+                  Buy
+                </button>
+                <button
+                  onClick={() => setModalMode('sell')}
+                  className="px-6 py-2 rounded-xl text-sm font-semibold bg-[#172033] hover:bg-[#1f2b45] text-slate-200 border border-[#232f4c] transition active:scale-95"
+                >
+                  Sell
+                </button>
+                <button
+                  onClick={() => setModalMode('import')}
+                  className="px-6 py-2 rounded-xl text-sm font-semibold bg-[#172033] hover:bg-[#1f2b45] text-slate-200 border border-[#232f4c] transition active:scale-95"
+                >
+                  Import
+                </button>
+              </div>
+
+              {/* Right Profile & Notifications */}
+              <div className="flex items-center space-x-4">
+                <button className="relative p-2 text-slate-400 hover:text-white bg-[#131b2e] border border-[#202c49] rounded-xl transition">
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                  </svg>
+                  <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-brand-blue"></span>
+                </button>
+                <div className="flex items-center space-x-2 pl-2">
+                  <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-purple-500 to-indigo-500 flex items-center justify-center text-white font-bold text-sm shadow-md">
+                    JD
+                  </div>
+                </div>
+              </div>
+            </header>
+
+            {/* Dashboard Content Grid */}
+            <div className="p-6 space-y-6 flex-1">
+              <div className="grid grid-cols-12 gap-6">
+                
+                {/* CANDLESTICK CHART PANEL (Col 1-9) */}
+                <div className="col-span-12 lg:col-span-9 bg-[#101626] border border-[#1c2740] rounded-2xl p-5 flex flex-col shadow-xl">
+                  {/* Chart Header Bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-[#1b253d]">
+                    {/* Coin Ticker & Price */}
+                    <div className="flex items-center space-x-4">
+                      <div className="flex items-center space-x-2.5 bg-[#162035] px-3 py-1.5 rounded-xl border border-[#223152] cursor-pointer hover:border-brand-blue transition">
+                        <div 
+                          className="w-6 h-6 rounded-full flex items-center justify-center text-white text-xs font-bold"
+                          style={{ backgroundColor: selectedCoin.color }}
+                        >
+                          {selectedCoin.id[0]}
+                        </div>
+                        <span className="font-bold text-white text-base tracking-wide">{selectedCoin.symbol}</span>
+                        <svg className="w-4 h-4 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
+                        </svg>
+                      </div>
+
+                      <div className="flex items-baseline space-x-3">
+                        <span className="text-2xl font-bold font-mono text-white tracking-tight">
+                          {selectedCoin.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        </span>
+                        <span className={`text-xs font-semibold px-2 py-0.5 rounded-md flex items-center space-x-1 ${
+                          selectedCoin.change >= 0 
+                            ? 'text-brand-green bg-brand-green/10' 
+                            : 'text-brand-red bg-brand-red/10'
+                        }`}>
+                          <span>{selectedCoin.change >= 0 ? '▲' : '▼'}</span>
+                          <span>{Math.abs(selectedCoin.change)}%</span>
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Timeframe Selectors */}
+                    <div className="flex items-center space-x-1 bg-[#151e33] p-1 rounded-xl border border-[#202c49]">
+                      {['1m', '5m', '15m', '1h', '4h', '1D'].map(tf => (
+                        <button
+                          key={tf}
+                          onClick={() => setTimeframe(tf)}
+                          className={`px-3 py-1 text-xs font-semibold rounded-lg transition ${
+                            timeframe === tf
+                              ? 'bg-brand-blue text-white shadow-sm'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {tf}
+                        </button>
+                      ))}
+                      <button className="p-1 text-slate-400 hover:text-slate-200 rounded-lg">
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* OHLC Bar Info */}
+                  <div className="py-2.5 flex flex-wrap items-center gap-x-4 text-xs font-mono text-slate-400">
+                    <span>O <strong className="text-brand-green font-normal">{(selectedCoin.price * 0.995).toFixed(2)}</strong></span>
+                    <span>H <strong className="text-brand-green font-normal">{(selectedCoin.price * 1.006).toFixed(2)}</strong></span>
+                    <span>L <strong className="text-brand-green font-normal">{(selectedCoin.price * 0.994).toFixed(2)}</strong></span>
+                    <span>C <strong className="text-brand-green font-normal">{selectedCoin.price.toFixed(2)}</strong></span>
+                    <span className="text-brand-green">+310.13 (+0.46%)</span>
+                  </div>
+
+                  {/* Chart Body: Drawing Tool Bar (Left) + Interactive Canvas Chart (Center) */}
+                  <div className="flex-1 flex gap-3 min-h-[360px] pt-2">
+                    {/* Drawing Toolbar */}
+                    <div className="w-9 flex-shrink-0 flex flex-col items-center space-y-2 py-2 bg-[#141b2c] border border-[#202c47] rounded-xl text-slate-400">
+                      {[
+                        { id: 'crosshair', icon: 'M12 4v16m8-8H4' },
+                        { id: 'trend', icon: 'M4 19L19 4M19 4h-6M19 4v6' },
+                        { id: 'pitchfork', icon: 'M5 12h14M12 5l7 7-7 7' },
+                        { id: 'text', icon: 'M4 6h16M12 6v14' },
+                        { id: 'smile', icon: 'M14.828 14.828a4 4 0 01-5.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
+                        { id: 'measure', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
+                        { id: 'magnet', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
+                        { id: 'lock', icon: 'M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z' },
+                        { id: 'trash', icon: 'M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16' }
+                      ].map(t => (
+                        <button
+                          key={t.id}
+                          onClick={() => setActiveTool(t.id)}
+                          className={`w-7 h-7 flex items-center justify-center rounded-lg transition ${
+                            activeTool === t.id ? 'bg-brand-blue text-white' : 'hover:text-white hover:bg-[#1d273f]'
+                          }`}
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" d={t.icon} />
+                          </svg>
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Candlestick Canvas Component */}
+                    <div className="flex-1 relative bg-[#0d1322] border border-[#1c263e] rounded-xl overflow-hidden p-2">
+                      <CandleChart coin={selectedCoin} timeframe={timeframe} />
+                    </div>
+                  </div>
+                </div>
+
+                {/* TOP COINS PANEL (Col 10-12) */}
+                <div className="col-span-12 lg:col-span-3 bg-[#101626] border border-[#1c2740] rounded-2xl p-5 flex flex-col shadow-xl">
+                  {/* Header */}
+                  <div className="flex items-center justify-between pb-3">
+                    <h2 className="text-base font-bold text-white flex items-center gap-2">
+                      <span>🔥</span> Top Coins
+                    </h2>
+                    <button className="text-xs text-brand-blue hover:text-blue-400 font-medium flex items-center gap-1">
+                      See All <span>→</span>
+                    </button>
+                  </div>
+
+                  {/* Tabs */}
+                  <div className="flex items-center space-x-1 border-b border-[#1d2740] pb-2 mb-3">
+                    {['Favorites', 'Trending', 'Gainers', 'Losers'].map(tab => (
+                      <button
+                        key={tab}
+                        onClick={() => setActiveCoinTab(tab)}
+                        className={`text-xs px-2.5 py-1 rounded-lg font-medium transition ${
+                          activeCoinTab === tab
+                            ? 'bg-brand-blue text-white'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {tab}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Coin List */}
+                  <div className="space-y-2 overflow-y-auto max-h-[380px] pr-1">
+                    {filteredCoins.map(coin => {
+                      const isSelected = selectedCoin.id === coin.id;
+                      return (
+                        <div
+                          key={coin.id}
+                          onClick={() => setSelectedCoin(coin)}
+                          className={`flex items-center justify-between p-2.5 rounded-xl cursor-pointer transition border ${
+                            isSelected
+                              ? 'bg-[#18233b] border-brand-blue/50 shadow-md'
+                              : 'bg-[#121929] border-[#1d2740] hover:border-[#2a3859]'
+                          }`}
+                        >
+                          {/* Coin Icon & Name */}
+                          <div className="flex items-center space-x-2.5">
+                            <div 
+                              className="w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-bold"
+                              style={{ backgroundColor: coin.color }}
+                            >
+                              {coin.id[0]}
+                            </div>
+                            <div>
+                              <div className="text-xs font-bold text-white">{coin.id}</div>
+                              <div className="text-[10px] text-slate-400">{coin.name}</div>
+                            </div>
+                          </div>
+
+                          {/* Price & Badge */}
+                          <div className="text-right">
+                            <div className="text-xs font-semibold font-mono text-white">
+                              ${coin.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                            </div>
+                            <span className={`inline-block text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                              coin.change >= 0 
+                                ? 'text-brand-green bg-brand-green/15' 
+                                : 'text-brand-red bg-brand-red/15'
+                            }`}>
+                              {coin.change >= 0 ? `+${coin.change}%` : `${coin.change}%`}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* BOTTOM LOGS & ACTIVITY PANEL (Col 1-12) */}
+                <div className="col-span-12 bg-[#101626] border border-[#1c2740] rounded-2xl p-5 shadow-xl">
+                  {/* Tabs & Controls */}
+                  <div className="flex items-center justify-between pb-3 border-b border-[#1b253e] mb-3">
+                    <div className="flex items-center space-x-6">
+                      {['Logs', 'Activity', 'Notifications'].map(tab => (
+                        <button
+                          key={tab}
+                          onClick={() => setActiveLogTab(tab)}
+                          className={`text-sm font-semibold pb-1.5 transition relative ${
+                            activeLogTab === tab
+                              ? 'text-white'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {tab}
+                          {activeLogTab === tab && (
+                            <span className="absolute bottom-0 left-0 w-full h-0.5 bg-brand-blue rounded-full"></span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="flex items-center space-x-2">
+                      <select className="bg-[#151e33] border border-[#202c49] text-xs text-slate-300 rounded-lg px-2.5 py-1.5 focus:outline-none">
+                        <option>Last 1 Hour</option>
+                        <option>Last 24 Hours</option>
+                        <option>Last 7 Days</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Log Items Stream */}
+                  <div className="space-y-2.5 font-mono text-xs">
+                    {logs.map(log => {
+                      const dotColor = 
+                        log.color === 'green' ? 'bg-brand-green' :
+                        log.color === 'yellow' ? 'bg-brand-yellow' : 'bg-brand-blue';
+                      return (
+                        <div key={log.id} className="flex items-center space-x-3 py-1 hover:bg-[#141b2c] px-2 rounded-lg transition">
+                          <span className="text-slate-500">{log.time}</span>
+                          <span className={`w-2 h-2 rounded-full ${dotColor}`}></span>
+                          <span className="text-slate-200">{log.text}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+              </div>
+            </div>
+          </main>
+
+          {/* Simple Buy/Sell/Import Modal */}
+          {modalMode && (
+            <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className="bg-[#121929] border border-[#232f4c] rounded-2xl p-6 w-full max-w-md shadow-2xl">
+                <div className="flex items-center justify-between pb-3 border-b border-[#1e2840] mb-4">
+                  <h3 className="text-lg font-bold text-white capitalize">{modalMode} Order - {selectedCoin.symbol}</h3>
+                  <button onClick={() => setModalMode(null)} className="text-slate-400 hover:text-white">✕</button>
+                </div>
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-xs text-slate-400 block mb-1">Market Price</label>
+                    <div className="font-mono text-lg font-bold text-white">${selectedCoin.price.toLocaleString()}</div>
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-400 block mb-1">Quantity ({selectedCoin.id})</label>
+                    <input
+                      type="number"
+                      value={orderQty}
+                      onChange={e => setOrderQty(e.target.value)}
+                      className="w-full bg-[#162137] border border-[#243355] rounded-xl px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-brand-blue"
+                    />
+                  </div>
+                  <div className="text-xs text-slate-400 flex justify-between">
+                    <span>Estimated Total:</span>
+                    <span className="font-mono text-white font-bold">${(orderQty * selectedCoin.price).toFixed(2)} USDT</span>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const newLog = {
+                        id: Date.now(),
+                        time: new Date().toTimeString().split(' ')[0],
+                        type: modalMode,
+                        color: modalMode === 'buy' ? 'green' : 'red',
+                        text: `Manual Order Executed: ${modalMode.toUpperCase()} ${orderQty} ${selectedCoin.id} at $${selectedCoin.price}`
+                      };
+                      setLogs(prev => [newLog, ...prev]);
+                      setModalMode(null);
+                    }}
+                    className={`w-full py-2.5 rounded-xl font-bold text-white transition ${
+                      modalMode === 'buy' ? 'bg-brand-blue hover:bg-blue-600' : 'bg-brand-red hover:bg-red-600'
+                    }`}
+                  >
+                    Confirm {modalMode.toUpperCase()}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // Interactive Candlestick Chart Component via Canvas
+    function CandleChart({ coin, timeframe }) {
+      const canvasRef = useRef(null);
+
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        const dpr = window.devicePixelRatio || 1;
+
+        // Resize canvas to client width/height
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+
+        const width = rect.width;
+        const height = rect.height;
+
+        // Generate synthetic historical candles based on current price
+        const numCandles = 50;
+        let basePrice = coin.price * 0.96;
+        const candles = [];
+        for (let i = 0; i < numCandles; i++) {
+          const change = (Math.sin(i * 0.3) + (Math.random() - 0.48)) * (coin.price * 0.006);
+          const open = basePrice;
+          const close = open + change;
+          const high = Math.max(open, close) + Math.random() * (coin.price * 0.004);
+          const low = Math.min(open, close) - Math.random() * (coin.price * 0.004);
+          const volume = Math.random() * 80 + 20;
+          candles.push({ open, close, high, low, volume });
+          basePrice = close;
+        }
+        // Pin last candle close to current coin price
+        candles[candles.length - 1].close = coin.price;
+
+        const allPrices = candles.flatMap(c => [c.high, c.low]);
+        const minPrice = Math.min(...allPrices);
+        const maxPrice = Math.max(...allPrices);
+        const priceRange = maxPrice - minPrice || 1;
+
+        const maxVolume = Math.max(...candles.map(c => c.volume));
+        const chartHeight = height - 40; // reserved for time axis & volume
+        const volumeHeight = 60;
+
+        // Clear canvas
+        ctx.clearRect(0, 0, width, height);
+
+        // Draw horizontal grid lines & price labels
+        const gridLines = 5;
+        ctx.strokeStyle = '#161f33';
+        ctx.lineWidth = 1;
+        ctx.font = '10px JetBrains Mono, monospace';
+        ctx.fillStyle = '#64748b';
+
+        for (let i = 0; i <= gridLines; i++) {
+          const y = (chartHeight / gridLines) * i + 10;
+          ctx.beginPath();
+          ctx.moveTo(30, y);
+          ctx.lineTo(width - 70, y);
+          ctx.stroke();
+
+          const priceVal = maxPrice - (i / gridLines) * priceRange;
+          ctx.fillText(priceVal.toFixed(2), width - 65, y + 3);
+        }
+
+        // Draw Candlesticks & Volumes
+        const candleAreaWidth = width - 90;
+        const candleWidth = Math.max(3, (candleAreaWidth / numCandles) * 0.65);
+        const step = candleAreaWidth / numCandles;
+
+        candles.forEach((c, i) => {
+          const x = 35 + i * step;
+          const isUp = c.close >= c.open;
+          const candleColor = isUp ? '#00d084' : '#ff4d6a';
+
+          // Y coordinates
+          const yOpen = chartHeight - ((c.open - minPrice) / priceRange) * (chartHeight - 40) - 20;
+          const yClose = chartHeight - ((c.close - minPrice) / priceRange) * (chartHeight - 40) - 20;
+          const yHigh = chartHeight - ((c.high - minPrice) / priceRange) * (chartHeight - 40) - 20;
+          const yLow = chartHeight - ((c.low - minPrice) / priceRange) * (chartHeight - 40) - 20;
+
+          // Draw Wick
+          ctx.strokeStyle = candleColor;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.moveTo(x + candleWidth / 2, yHigh);
+          ctx.lineTo(x + candleWidth / 2, yLow);
+          ctx.stroke();
+
+          // Draw Body
+          ctx.fillStyle = candleColor;
+          const bodyY = Math.min(yOpen, yClose);
+          const bodyHeight = Math.max(2, Math.abs(yClose - yOpen));
+          ctx.fillRect(x, bodyY, candleWidth, bodyHeight);
+
+          // Draw Volume bar
+          const vBarHeight = (c.volume / maxVolume) * volumeHeight;
+          ctx.fillStyle = isUp ? 'rgba(0, 208, 132, 0.28)' : 'rgba(255, 77, 106, 0.28)';
+          ctx.fillRect(x, height - vBarHeight - 15, candleWidth, vBarHeight);
+        });
+
+        // Draw Current Price Line & Badge
+        const currY = chartHeight - ((coin.price - minPrice) / priceRange) * (chartHeight - 40) - 20;
+        ctx.strokeStyle = '#00d084';
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(35, currY);
+        ctx.lineTo(width - 70, currY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Badge on right axis
+        ctx.fillStyle = '#00d084';
+        ctx.fillRect(width - 68, currY - 9, 65, 18);
+        ctx.fillStyle = '#090d16';
+        ctx.font = 'bold 10px JetBrains Mono, monospace';
+        ctx.fillText(coin.price.toFixed(2), width - 64, currY + 4);
+
+        // Time axis labels
+        ctx.fillStyle = '#64748b';
+        ctx.font = '10px Inter, sans-serif';
+        const times = ['09:00', '12:00', '15:00', '18:00', '21:00'];
+        times.forEach((t, idx) => {
+          const tx = 40 + (candleAreaWidth / (times.length - 1)) * idx;
+          ctx.fillText(t, tx - 12, height - 3);
+        });
+
+      }, [coin, timeframe]);
+
+      return <canvas ref={canvasRef} className="w-full h-full block" />;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
+

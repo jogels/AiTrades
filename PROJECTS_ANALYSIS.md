@@ -157,3 +157,4 @@ Proyek ini merupakan referensi berstandar institusional terbaik di dalam koleksi
 1. Mempelajari cara menggabungkan LLM dengan aturan matematika finansial tanpa risiko halusinasi.
 2. Memahami desain *Point-in-Time* data agar hasil backtest valid di dunia nyata.
 3. Mengembangkan agen analis kustom dengan filosofi investasi baru.
+
