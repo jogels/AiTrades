@@ -1,0 +1,35 @@
+{
+  "name": "aitrades-decision-intelligence",
+  "private": true,
+  "version": "2.6.2",
+  "description": "AI Trading & Decision Intelligence Robot for Crypto & Saham (React + TypeScript + Tailwind CSS + ECharts + Lightweight Charts)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "server": "python3 server.py"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.56.2",
+    "clsx": "^2.1.1",
+    "echarts": "^5.5.1",
+    "echarts-for-react": "^3.0.2",
+    "lightweight-charts": "^4.2.0",
+    "lucide-react": "^0.446.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^2.5.2",
+    "zustand": "^4.5.5"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.10",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.13",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8"
+  }
+}
